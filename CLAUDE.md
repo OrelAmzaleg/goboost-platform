@@ -47,7 +47,7 @@
 מה ש**רק אנחנו עושים** — לא ב-Paperclip, לא ב-Hermes, לא ב-OpenClaw:
 
 - **Hebrew RTL UI מלא** — כל מילה בעברית, כל layout RTL-aware
-- **Office Visualization** — Phaser scene של משרד עם דמויות, חדרים, אנימציות (פורט מ-prototype)
+- **Office Visualization ("Computer game" paradigm)** — Phaser scene של משרד עם דמויות, חדרים, אנימציות. **זה לא IP אבל זה משמעותי מאוד לשוק:** הלקוח מדבר עם משהו ויזואלי שעונה, מציג הודעות כאילו הוא מדבר, מפעיל כלים בצורה נראית — לא עם dashboard שמדפיס לו משימות בחלון אחר. ההבדל קריטי לקשר רגשי, לקלות מכירה, ול-wow מהיר. **Paperclip's UI הוא dashboard מתקדם — שלנו צריך להיות "Tycoon-like" experience.** ב-future נשתמש בנכסי [pixel-agents](https://github.com/pablodelucca/pixel-agents) (Metro City sprite pack, MIT) להעלאת רמת הגימור.
 - **5-Layer Tool Visualization Bridge** — chat pill + badge + action icon + bubble narration + side panel (כשסוכן מפעיל כלי, כל 5 השכבות נדלקות מנקודה אחת)
 - **Wizards לבעלי עסקים ישראליים** — Company Wizard, Agent Builder, Sector Selector
 - **Sector presets** — משרד עו"ד, רואי חשבון, מרפאה, חברת תוכנה, etc. עם brain seed עשיר, agents מוגדרים, tools מותאמים
