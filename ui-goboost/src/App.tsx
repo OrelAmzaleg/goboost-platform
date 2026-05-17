@@ -36,12 +36,43 @@ function getOfficeState(): OfficeState {
 }
 
 function App() {
-  // Browser runtime (dev or static dist): dispatch mock messages after the
-  // useExtensionMessages listener has been registered.
+  // Browser runtime (dev or static dist): load static assets via browserMock,
+  // then connect to Paperclip via paperclipApi for live agent events.
+  // The two are complementary: browserMock loads sprites/floors/walls/layout
+  // (which never come from Paperclip), and paperclipApi loads live agents.
   useEffect(() => {
-    if (isBrowserRuntime) {
-      void import('./browserMock.js').then(({ dispatchMockMessages }) => dispatchMockMessages());
-    }
+    if (!isBrowserRuntime) return;
+
+    void (async () => {
+      const { dispatchMockMessages } = await import('./browserMock.js');
+      dispatchMockMessages();
+      // Hand off to Paperclip after the asset/layout messages have been
+      // dispatched, so the office is ready to receive agent events.
+      const { startPaperclipApi } = await import('./paperclipApi.js');
+      const baseUrl =
+        (import.meta.env.VITE_PAPERCLIP_API_URL as string | undefined) ?? undefined;
+      void startPaperclipApi({
+        baseUrl,
+        onStatusChange: (status) => {
+          // Reflect connection status into the bootstrap banner so the operator
+          // can see at a glance whether Paperclip is connected. Banner element
+          // is defined in index.html (#gb-bootstrap-banner .gb-left).
+          const el = document.querySelector('#gb-bootstrap-banner .gb-left');
+          if (!el) return;
+          const dot =
+            status.state === 'connected'
+              ? '🟢'
+              : status.state === 'connecting'
+                ? '🟡'
+                : status.state === 'disconnected'
+                  ? '🔴'
+                  : status.state === 'no-paperclip'
+                    ? '⚫'
+                    : '⚪';
+          el.textContent = `${dot} ${status.message}`;
+        },
+      });
+    })();
   }, []);
 
   const editor = useEditorActions(getOfficeState, editorState);

@@ -263,16 +263,9 @@ export function dispatchMockMessages(): void {
     lastSeenVersion: '1.2',
   });
 
-  // GoBoost addition: spawn a couple of mock agents so the office is not
-  // empty in browser-only mode. The upstream pixel-agents flow relies on a
-  // VS Code extension to detect Claude Code sessions and dispatch these;
-  // we don't have that, so we hand-roll a few here. Removed once
-  // `paperclipApi.ts` wires real Paperclip agent events.
-  dispatch({ type: 'agentCreated', id: 1, folderName: 'דנה (CEO)' });
-  dispatch({ type: 'agentCreated', id: 2, folderName: 'יוסי (מכירות)' });
-  dispatch({ type: 'agentCreated', id: 3, folderName: 'מאיה (שירות)' });
-  dispatch({ type: 'agentStatus', id: 1, status: 'active' });
-  dispatch({ type: 'agentStatus', id: 2, status: 'waiting' });
-
-  console.log('[BrowserMock] Messages dispatched (including 3 GoBoost mock agents)');
+  // GoBoost note: agents are NO LONGER dispatched here. They come from
+  // Paperclip via `paperclipApi.ts` (called right after this function in
+  // App.tsx). browserMock now does exactly one job — load office assets
+  // and layout from the local Vite asset endpoints.
+  console.log('[BrowserMock] Office assets loaded (agents come from paperclipApi)');
 }

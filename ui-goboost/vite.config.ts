@@ -110,9 +110,19 @@ export default defineConfig({
     emptyOutDir: true,
   },
   // GoBoost: serve on :3200 so it lives alongside Paperclip's :3100.
+  // The /api proxy lets us call Paperclip via same-origin from this UI —
+  // Paperclip server doesn't ship CORS for cross-origin browsers in
+  // local_trusted mode, so a Vite proxy is the path of least friction.
   server: {
     port: 3200,
     strictPort: false,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3100',
+        changeOrigin: true,
+        ws: true, // also proxy the WebSocket at /api/companies/:id/events/ws
+      },
+    },
   },
   base: './',
 });
