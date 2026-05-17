@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GoBoost · ממשק ויזואלי</title>
+    <style>
+      /* GoBoost: top banner so we know our shell is the one running.
+         Removed once we build a real top-bar component. */
+      #gb-bootstrap-banner {
+        position: fixed;
+        inset-block-start: 0;
+        inset-inline-start: 0;
+        inset-inline-end: 0;
+        height: 32px;
+        background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%);
+        color: #fff;
+        font-family: 'Heebo', 'Assistant', 'Rubik', system-ui, -apple-system, sans-serif;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 14px;
+        z-index: 9999;
+        direction: rtl;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+      }
+      #gb-bootstrap-banner .gb-right {
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+      #gb-bootstrap-banner .gb-left {
+        opacity: 0.85;
+        font-size: 11px;
+        font-family: system-ui, monospace;
+      }
+      body {
+        margin: 0;
+        padding-block-start: 32px; /* room for banner */
+      }
+    </style>
+  </head>
+  <body>
+    <div id="gb-bootstrap-banner">
+      <span class="gb-right">🟣 GoBoost · ממשק ויזואלי · בשלב הקמה</span>
+      <span class="gb-left">pixel-agents engine · port 3200 · paperclip api → :3100</span>
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

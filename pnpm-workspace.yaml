@@ -12,3 +12,6 @@ packages:
   - server
   - ui
   - cli
+  # GoBoost visual UI — derived from pixel-agents (MIT, see ui-goboost/NOTICE.md).
+  # Runs alongside Paperclip's classic `ui/` for parallel-development & visual debug.
+  - ui-goboost
