@@ -263,5 +263,16 @@ export function dispatchMockMessages(): void {
     lastSeenVersion: '1.2',
   });
 
-  console.log('[BrowserMock] Messages dispatched');
+  // GoBoost addition: spawn a couple of mock agents so the office is not
+  // empty in browser-only mode. The upstream pixel-agents flow relies on a
+  // VS Code extension to detect Claude Code sessions and dispatch these;
+  // we don't have that, so we hand-roll a few here. Removed once
+  // `paperclipApi.ts` wires real Paperclip agent events.
+  dispatch({ type: 'agentCreated', id: 1, folderName: 'דנה (CEO)' });
+  dispatch({ type: 'agentCreated', id: 2, folderName: 'יוסי (מכירות)' });
+  dispatch({ type: 'agentCreated', id: 3, folderName: 'מאיה (שירות)' });
+  dispatch({ type: 'agentStatus', id: 1, status: 'active' });
+  dispatch({ type: 'agentStatus', id: 2, status: 'waiting' });
+
+  console.log('[BrowserMock] Messages dispatched (including 3 GoBoost mock agents)');
 }
