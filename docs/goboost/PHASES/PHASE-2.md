@@ -1,154 +1,112 @@
-# Phase 2 — UI Wrapper (Hebrew RTL + Visualization Base)
+# Phase 2 — Visual UI Layer (Parallel Coexisting Strategy)
 
-**יעד:** ה-UI שמשתמש פוגש הוא **שלנו**: בעברית, RTL מלא, עם תחילת ויזואליזציית המשרד, ועם wizards פשוטים להקמת company.
+**יעד:** ה-UI שמשתמש פוגש הוא **שלנו** — pixel-agents engine + Hebrew RTL shell + Wizards + הצגה דינמית של מה שקורה ב-Paperclip בזמן אמת.
+**Trigger:** Phase 1 done (ARCHITECTURE-MAP + MIGRATION-FROM-PROTOTYPE in place, Paperclip running).
+
+---
+
+## Strategy Recap (decided during Phase 1)
+
+ה-PHASE-2 הזה נכתב מחדש אחרי שגילינו את [pixel-agents](https://github.com/pablodelucca/pixel-agents) ואת היכולת לחיות עם שני UIs במקביל. החלטות מפתח:
+
+1. **Parallel Coexistence, not Wrap vs Replace.** ה-Paperclip UI (`ui/`) ו-GoBoost UI (`ui-goboost/`) חיים בו-זמנית — `:3100` ו-`:3200`. שתיהן מדברות לאותו backend. ה-Classic UI נשאר כ-admin reference וכ-visual debug ground truth לאורך כל הפיתוח.
+2. **Lazy strip של pixel-agents UI.** משאירים את הפיצ'רים שלהם כמו שהם בינתיים, רק מחביאים מה שבולט שגוי. נחתוך באופן ממוקד ב-iterations עתידיות.
+3. **Real data, no more mocks.** ה-3 mock agents שב-`browserMock.ts` הם פיגום ל-Iteration 1 בלבד. ברגע ש-`paperclipApi.ts` עובד — מורידים אותם.
+4. **WhatsApp chat panel** — feature חשוב, יבוא אחרי שיש dat0 אמיתי.
+5. **🟢 Hierarchy-Derived Dynamic Layout** — IP ייחודי. החדרים ייגזרו מ-`agents.reportsTo` במקום מקובץ JSON סטטי. גדול יותר, יבוא אחרי ה-WhatsApp panel.
+
+---
+
+## Iterations (כל אחד = goal צר וברור)
+
+### Iteration 2.0 — Scaffold (done)
+
 **Trigger:** Phase 1 done.
+**Done when:** `ui-goboost/` קיים, רץ על `:3200`, מציג את ה-pixel-agents engine + Hebrew RTL banner + 3 mock agents.
+
+- [x] Fork pixel-agents `webview-ui/` + `shared/` → `goboost-platform/ui-goboost/`
+- [x] Adjust vite.config (port 3200, local outDir, shared imports)
+- [x] Hebrew RTL in `index.html`
+- [x] Add to pnpm-workspace, root scripts (`dev:goboost`)
+- [x] 3 mock agents in browserMock as engine proof
+- [x] NOTICE.md + LICENSE-PIXEL-AGENTS for attribution
+- [x] commit + push
+
+### Iteration 2.A — Real Data (`paperclipApi.ts`) ⬅ הבא
+
+**Trigger:** Iteration 2.0 done.
+**Done when:** יוצרים Company + agents ב-Paperclip UI (`:3100`) → הדמויות מופיעות במשרד שלנו (`:3200`) באופן אוטומטי. ה-3 mocks מוסרים מ-browserMock.
+
+- [ ] חקירת ה-API של Paperclip: אילו endpoints חושפים agents/companies/runs/issues/tool calls (`/api/companies`, `/api/agents`, `/api/heartbeat-runs`, `/api/issues`...)
+- [ ] בדיקה: יש WebSocket/SSE לעדכונים בזמן אמת, או שמחזיקים polling?
+- [ ] בניית `ui-goboost/src/paperclipApi.ts` — מודול שמתחבר ל-`http://localhost:3100/api/*`
+- [ ] mapping table: Paperclip event → pixel-agents message
+  - `agent created/listed` → `agentCreated` message
+  - `agent status change` → `agentStatus` message
+  - `heartbeat run started/finished` → `agentToolStart`/`agentToolDone` events
+  - `agent paused` → `agentStatus: 'waiting'` or similar
+- [ ] חיבור ב-`App.tsx`: אם `paperclipApi` זמין → תשתמש בו במקום `browserMock`. אם לא (אופציה fallback) → mocks
+- [ ] Config: `import.meta.env.VITE_PAPERCLIP_API_URL` ברירת מחדל `http://localhost:3100/api`
+- [ ] הסרת 3 ה-mock agents מ-browserMock (או החלפתם בהודעה "אין חיבור ל-Paperclip" + הפניה ל-:3100)
+- [ ] תיעוד: README ב-`ui-goboost/src/paperclipApi.ts` עם ה-mapping המלא
+- [ ] test scenario: יצירת Company בPaperclip → רואים agents בGoBoost UI
+
+**Open questions לפני התחלה:**
+- האם Paperclip מציע SSE/WebSocket או רק REST? צריך לחפש ב-`server/src/realtime/`
+- מה ה-shape של `TranscriptEntry` events? נגלה תוך כדי כשנקרא את `heartbeat_run_events` API
+
+### Iteration 2.B — WhatsApp Chat Panel
+
+**Trigger:** Iteration 2.A done — יש agents חיים.
+**Done when:** פאנל ימני קבוע עם chat thread של ה-agent שנבחר. שולחים הודעה → מופיעה ב-issue comments של ה-agent. הודעת תגובה של ה-agent מופיעה בפאנל אוטומטית.
+
+- [ ] עיצוב UI: פאנל ימני קבוע (300-380px), bubbles בסגנון WhatsApp (ירוק=outgoing, אפור=incoming), avatar של ה-agent למעלה
+- [ ] חיבור ל-`/api/issues/:id/comments` (Paperclip API)
+- [ ] שליחה: `POST /api/issues/:id/comments` עם message מהמשתמש
+- [ ] קבלה: subscribe לעדכוני comments בזמן אמת
+- [ ] selection: כשבוחרים agent ב-office, ה-panel נטען עם ה-issue האחרון/הפעיל שלו
+- [ ] תמיכה ב-attachments
+- [ ] Hebrew RTL בכל ה-bubbles והפלייסהולדרים
+
+### Iteration 2.C — Hierarchy-Derived Dynamic Layout (🟢 GoBoost IP)
+
+**Trigger:** Iterations 2.A + 2.B done.
+**Done when:** ה-layout של החדרים נוצר אוטומטית מ-`agents.reportsTo` של ה-company. כל "team" (manager + direct reports) = חדר משלו. החלפת company → החלפת layout.
+
+- [ ] חקירה: `OfficeState` של pixel-agents מקבל layout מ-`layoutLoaded` event. הם משתמשים ב-static JSON. נצטרך להחליף את ה-loader
+- [ ] בניית layout-generator: input = רשימת agents עם `reportsTo` → output = layout JSON שתואם ל-pixel-agents schema
+- [ ] אלגוריתם: BFS על `reportsTo` tree → רמה 1 = חדר CEO, רמות עמוקות יותר = חדרים נוספים. רהיטים: 1 PC + שולחן לכל סוכן, ספה משותפת לכל חדר
+- [ ] שיבוץ characters: כל agent יושב בחדר של ה-manager שלו (או בחדר CEO אם הוא בעצמו CEO)
+- [ ] עדכון דינמי: אם hierarchy משתנה ב-Paperclip → layout מתעדכן
+- [ ] אופציה לעריכה ידנית: גם ה-layout המקורי שלהם נשאר זמין כ-override
 
 ---
 
-## ההחלטה הקריטית — Wrap vs. Replace
+## Definition of Done — Phase 2 כולה
 
-לפי מה שגילינו ב-Phase 1 (במסמך `ARCHITECTURE-MAP`), נחליט בין שתי גישות:
+1. ✅ `ui-goboost` רץ ב-`:3200` עם Hebrew RTL (Iteration 2.0)
+2. ⏳ Real-time chars מגיעים מ-Paperclip, אין יותר mocks (Iteration 2.A)
+3. ⏳ WhatsApp chat panel פעיל ומחובר ל-issue comments (Iteration 2.B)
+4. ⏳ Hierarchy-derived layout עובד דינמית (Iteration 2.C)
+5. ⏳ commit נקי + push
 
-### גישה A — Wrap (אם ה-UI של Paperclip מודולרי)
+## מה לא נכלל ב-Phase 2 (יחכה ל-Phase 3+)
 
-- שומרים את ה-React UI שלהם לחלקים שעובדים well (admin, settings, low-level views)
-- בונים שכבת UI שלנו לחלקים שהמשתמש פוגש (Dashboard, Wizards, Company View, Office Visualization)
-- ה-Hebrew RTL מוחל גלובלית — גם על מה שנשאר משלהם וגם על שלנו
-- חיסכון: לא בונים מהתחלה את כל ה-admin panel
-- עלות: צריך להבטיח i18n שלהם תקין, ותפקוד RTL שלהם
-
-### גישה B — Replace (אם ה-UI שלהם hardcoded ל-English או לא ידידותי ל-RTL)
-
-- מחליפים לחלוטין את ה-React UI שלהם, משאירים רק את ה-backend
-- ה-UI שלנו הוא single SPA חדש שמדבר עם ה-API של Paperclip
-- חיסכון: שליטה מלאה, אסתטיקה אחידה, RTL מהיום הראשון
-- עלות: צריך לבנות גם את ה-admin panel + settings + audit views
-
-**ההחלטה נופלת אחרי Phase 1.** אם ה-UI שלהם משתמש ב-i18n library טוב — A. אם זה hardcoded — B.
-
----
-
-## Deliverables (משותפים לשתי הגישות)
-
-1. **Hebrew RTL Theme** — Tailwind config + CSS base שמטפל ב-RTL, fonts עבריים (Heebo / Rubik / Assistant), כיוון icons הפוך
-2. **i18n Layer** — מערכת translations שמתאימה לעברית קודם, עם hooks ל-content מ-Paperclip שעוד בעברית
-3. **Wizards פשוטים:**
-   - Company Wizard — 4-6 שלבים: שם, סקטור, גודל, ערוצי תקשורת, agent ראשון, אישור
-   - Agent Builder — 3-4 שלבים: role, soul, skills, tools
-   - Sector Selector — בחירת preset מתוך 2-3 פרי-built (משרד עו"ד, רואי חשבון, חברת תוכנה — קל יותר ב-Phase זה, sectors עמוקים יותר ב-Phase 3)
-4. **Office Visualization v0** — Phaser scene בסיסי, חדר אחד, 1-2 דמויות, breathing animation, אנימציה כאשר agent פעיל
-5. **5-Layer Tool Visualization Bridge** (פורט מ-prototype) — אם adapter קורא לכלי, נדלקים: chat pill + badge + action icon + bubble narration + side panel
-6. **Hebrew Error Handling** — כל error message בעברית, לא stack traces ל-UI
-
----
-
-## Process Steps (כל שלב מתבסס על הקודם)
-
-### שלב 1 — UI Foundation
-
-**Trigger:** ההחלטה wrap vs replace נופלת (מבוסס על ARCHITECTURE-MAP מ-Phase 1).
-**Done when:** Tailwind+RTL מותקנים, font עברי מוטמע, layout בסיסי שלנו עובד.
-
-- [ ] התקנת Tailwind + RTL plugin (`tailwindcss-rtl`)
-- [ ] הגדרת Heebo font ב-`index.html` + Tailwind config
-- [ ] גלובלי `<html dir="rtl" lang="he">` — וידוא שזה תקף גם בעמודים של Paperclip
-- [ ] בדיקת אינטגרציה: עמוד admin של Paperclip ב-RTL — מה נשבר? תיעוד
-- [ ] (אם גישה A) — בניית wrapper layout שמכיל את ה-UI שלהם + הוספת sidebar/topbar שלנו
-- [ ] (אם גישה B) — יצירת SPA חדש ב-`apps/goboost-ui/` שמדבר עם API של Paperclip
-
-### שלב 2 — i18n + Translations
-
-**Trigger:** שלב 1 done — RTL foundation עובד.
-**Done when:** מסך הראשי כולו בעברית, אין מילה באנגלית בעין.
-
-- [ ] בחירת i18n library (`react-i18next` מומלץ — תקן בתעשייה)
-- [ ] קונפיגורציה: עברית primary, English fallback
-- [ ] תרגום של ה-strings הכי נראים: navigation, common buttons, statuses, dialogs
-- [ ] (אם גישה A) — patch ל-Paperclip strings שאי-אפשר לתרגם דרך i18n שלהם
-- [ ] testing — מסך הראשי כולו בעברית
-
-### שלב 3 — Wizards
-
-**Trigger:** שלבים 1-2 done — יש לנו UI עברי תקין לבנות עליו.
-**Done when:** Company Wizard + Agent Builder + Sector Selector עובדים end-to-end.
-
-- [ ] עיצוב flow של Company Wizard — 4-6 שלבים, navigation, validation, progress bar
-- [ ] בניית Company Wizard component — 6 שלבים סודרים, state בנפרד מ-Paperclip data model
-- [ ] על completion — קריאה ל-API של Paperclip ליצירת Company + Agents
-- [ ] Agent Builder — דומה אבל קצר יותר (3-4 שלבים)
-- [ ] Sector Selector — 2-3 קוביות מאוירות, בחירה → טעינת preset
-
-### שלב 4 — Office Visualization v0
-
-**Trigger:** שלב 1 done (אפשר במקביל לשלבים 2-3).
-**Done when:** Phaser scene נטען, דמויות נושמות, חיבור ראשוני ל-state של Paperclip עובד.
-
-- [ ] התקנת Phaser ב-frontend
-- [ ] React-Phaser bridge — div container + useEffect
-- [ ] Scene בסיסי — חדר יחיד, רקע פשוט, רצפה
-- [ ] CharacterRenderer — 1-2 דמויות בסיסיות (placeholder, port מ-prototype)
-- [ ] Breathing animation — תמיד רצה, גם כשאין activity
-- [ ] חיבור ל-state של Paperclip — כשagent רץ task, דמותו זזה
-- [ ] (port מ-prototype — `src/engine/rendering/`)
-
-### שלב 5 — 5-Layer Tool Visualization Bridge
-
-**Trigger:** שלבים 3+4 done — יש wizards פעילים ויש Phaser scene עם דמויות.
-**Done when:** כל 5 השכבות נדלקות אוטומטית מנקודה אחת כשadapter קורא לכלי.
-
-זה ה-IP החזק שלנו. פורט מהקוד הקיים [src/services/agents/AgentVisualBridge.ts](src/services/agents/AgentVisualBridge.ts) ו-helpers.
-
-- [ ] חיבור ל-event stream של Paperclip — מתי adapter מתחיל tool call, מתי מסיים
-- [ ] Layer 1 — chat pill ב-WhatsApp UI ("דנה משתמשת ב-CRM...")
-- [ ] Layer 2 — badge על דמות הסוכן ב-Office Visualization
-- [ ] Layer 3 — action icon מעל החדר שלו
-- [ ] Layer 4 — bubble narration (דנה אומרת "אני בודקת...")
-- [ ] Layer 5 — side panel update ("דנה: השתמשה ב-CRM, החזירה 3 רשומות")
-- [ ] all 5 layers מתעוררות מנקודה אחת — `bridge.markToolStart()` / `bridge.markToolEnd()`
-
-### שלב 6 — Stabilize
-
-**Trigger:** שלבים 1-5 done.
-**Done when:** Phase 2 Definition of Done מתקיים, commit נקי + push.
-
-- [ ] תיקון bugs מהשלבים הקודמים
-- [ ] בדיקה רוחבית של ה-UI — וידוא שהכל RTL, אין מילה לא מתורגמת בעין
-- [ ] עדכון `CLAUDE.md` עם learnings חדשים אם יש
-- [ ] commit נקי + push
-
----
-
-## Definition of Done
-
-1. ✅ המשתמש פותח את ה-platform → רואה עברית מלאה, RTL מלא
-2. ✅ Wizard של Company עובד end-to-end (6 שלבים → company נוצרת)
-3. ✅ Wizard של Agent עובד end-to-end
-4. ✅ 1-2 sector presets זמינים לבחירה
-5. ✅ Office Visualization נטען עם 1-2 דמויות שנושמות
-6. ✅ כשAgent רץ task — 5 השכבות נדלקות
-7. ✅ אין error message ב-UI באנגלית
-8. ✅ commit נקי
-
----
-
-## פתוחות / החלטות שיוכרעו תוך כדי
-
-- **Routing:** האם משתמשים ב-routing של Paperclip או בונים שלנו?
-- **State management:** Zustand (כמו prototype) או redux/jotai לפי מה שPaperclip משתמש?
-- **Authentication:** Paperclip ודאי כבר יש להם — נשאיר את שלהם, רק נתרגם
-- **Mobile responsive:** דחיינו ל-Phase 4. בדמואים אנחנו על desktop
-- **Color scheme:** GoBoost branding — צריך אצלך החלטה. Default יהיה משהו נייטרלי בינתיים
-
----
+- **Wizards (Company / Agent / Sector)** — ל-Phase 3 (Methodology Port)
+- **Office Visualization sprites חדשים** — Phase 17 (per old roadmap)
+- **Brain panel** — Phase 3-4
+- **Inspection panels (agent editor, etc.)** — Phase 3
+- **Sector presets ישראליים** — Phase 3
+- **Israeli tools (Gmail RTL, חשבונית ירוקה, ...)** — Phase 3
 
 ## אם תוך כדי גילינו ש...
 
-- **Paperclip UI עמוק יותר ממה שחשבנו (admin עם 20+ דפים):** גישה A. נעטוף בלי לגעת.
-- **Wizards דורשים שינוי במודל של Paperclip (למשל אין concept של "sector preset"):** נוסיף שכבת preset שלנו לפני הקריאה ל-API שלהם — שכבה ב-GoBoost layer
-- **Phaser דורש refactor של React-Phaser bridge בגלל Paperclip stack:** נדחה את ה-Office Visualization ל-Phase 4 ונשקיע יותר ב-UI הטקסטואלי
+- **Paperclip לא חושף SSE/WebSocket** — Iteration 2.A יהיה polling-based, פחות אלגנטי אבל עובד
+- **ה-comment system של Paperclip לא מתאים ל-chat real-time** — נדרש PATCH ל-fork או חידוש endpoint
+- **Hierarchy-derived layout מורכב מאוד** — נדחה את Iteration 2.C ל-Phase 3, נשאיר את ה-layout הסטטי בינתיים
 
 ---
 
 ## מה הולך אחרי Phase 2
 
-Phase 3 — Methodology Port. אחרי שיש לנו UI חזק וויזואלי, מעבירים את ה-content והמתודולוגיות שלנו: 4-step ritual של office-runner, slice-from-plan, sector presets עמוקים יותר, ה-Israeli tools pack הראשון.
+Phase 3 — Methodology Port + Israeli Content Pack (כפי שמוגדר ב-`docs/goboost/PHASES/PHASE-3.md`, אבל נעדכן את ה-Trigger כדי שיתחיל אחרי 2.C ולא אחרי 2.6).
