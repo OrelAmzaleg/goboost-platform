@@ -38,6 +38,40 @@ const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 const PAPERCLIP_PROBE_TIMEOUT_MS = 4_000;
 
+// ── Module-level shared state ─────────────────────────────────────────────
+// Helpers below (`fetchAgentIssues`, `postIssueComment`, etc.) need to read
+// the active company id, the configured base URL, and the UUID↔numeric
+// agent-id mapping. `startPaperclipApi` writes here when it boots.
+//
+// This is a singleton because there's only ever one Paperclip connection
+// per browser tab. If we ever support multi-company switching the call
+// pattern stays the same, only the contents change.
+
+let moduleBaseUrl = DEFAULT_PAPERCLIP_BASE;
+let moduleCompanyId: string | null = null;
+let moduleCompanyName: string | null = null;
+let moduleIdMapper: IdMapper | null = null;
+
+// Activity event subscribers — used by the chat panel to refresh on
+// `activity.logged` events (new comment, etc.).
+type ActivityEventListener = (payload: Record<string, unknown>) => void;
+const activityListeners = new Set<ActivityEventListener>();
+
+export function subscribeActivity(listener: ActivityEventListener): () => void {
+  activityListeners.add(listener);
+  return () => activityListeners.delete(listener);
+}
+
+function emitActivity(payload: Record<string, unknown>): void {
+  for (const fn of activityListeners) {
+    try {
+      fn(payload);
+    } catch (err) {
+      console.warn('[PaperclipApi] activity listener threw:', err);
+    }
+  }
+}
+
 // ── State for the banner indicator ────────────────────────────────────────
 
 export type PaperclipConnectionState =
@@ -77,6 +111,35 @@ interface PaperclipLiveEvent {
   type: string;
   createdAt: string;
   payload?: Record<string, unknown>;
+}
+
+// Public shapes consumed by the WhatsApp panel + future task panel.
+
+export interface PaperclipIssue {
+  id: string;
+  companyId: string;
+  parentId: string | null;
+  title: string;
+  description: string | null;
+  status: string;
+  priority?: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  identifier?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PaperclipComment {
+  id: string;
+  companyId: string;
+  issueId: string;
+  authorAgentId: string | null;
+  authorUserId: string | null;
+  authorType: string | null; // 'agent' | 'user' | 'system' | ...
+  body: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // ── UUID ↔ numeric id mapping ─────────────────────────────────────────────
@@ -128,6 +191,88 @@ function wsUrlFromBase(baseUrl: string, companyId: string): string {
   }
   const wsBase = baseUrl.replace(/^http/i, 'ws');
   return `${wsBase}/api/companies/${encodeURIComponent(companyId)}/events/ws`;
+}
+
+// ── Public helpers consumed by chat panel / future task panel ─────────────
+
+/** Returns the active company id, or null if not yet connected. */
+export function getActiveCompanyId(): string | null {
+  return moduleCompanyId;
+}
+
+/** Returns the active company name, or null. Useful for headers. */
+export function getActiveCompanyName(): string | null {
+  return moduleCompanyName;
+}
+
+/** Translate numeric pixel-agents id → Paperclip UUID. */
+export function uuidForNumericAgentId(numericId: number): string | null {
+  if (!moduleIdMapper) return null;
+  return moduleIdMapper.toUuid(numericId) ?? null;
+}
+
+/**
+ * List issues assigned to a given agent (most recent first). Backend
+ * default ordering is `updatedAt DESC`.
+ */
+export async function fetchAgentIssues(agentUuid: string): Promise<PaperclipIssue[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues?assigneeAgentId=${encodeURIComponent(agentUuid)}&limit=50`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    // The endpoint returns either a plain array or { issues: [...] } depending
+    // on filters — normalize.
+    if (Array.isArray(raw)) return raw as PaperclipIssue[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { issues?: unknown }).issues)) {
+      return (raw as { issues: PaperclipIssue[] }).issues;
+    }
+    console.warn('[PaperclipApi] unexpected issues response shape:', raw);
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentIssues failed:', err);
+    return [];
+  }
+}
+
+/** List comments on an issue, ascending (oldest first — chat order). */
+export async function fetchIssueComments(issueId: string): Promise<PaperclipComment[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/comments?order=asc&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return (await r.json()) as PaperclipComment[];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueComments failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Post a new comment to an issue as the human board user. The backend
+ * (`POST /api/issues/:id/comments`) records it, fires activity.logged on
+ * the WS, and the chat panel picks it up via subscribeActivity.
+ */
+export async function postIssueComment(issueId: string, body: string): Promise<PaperclipComment | null> {
+  const text = body.trim();
+  if (!text) return null;
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/comments`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: text }),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipComment;
+  } catch (err) {
+    console.warn('[PaperclipApi] postIssueComment failed:', err);
+    return null;
+  }
 }
 
 async function fetchJson<T>(url: string, timeoutMs?: number): Promise<T> {
@@ -190,6 +335,11 @@ export async function startPaperclipApi(
   const setStatus = opts.onStatusChange ?? (() => {});
   const idMapper = new IdMapper();
 
+  // Publish to module-level singletons so chat panel + future task panel
+  // helpers (fetchAgentIssues, postIssueComment, ...) can read them.
+  moduleBaseUrl = baseUrl;
+  moduleIdMapper = idMapper;
+
   // ── Step 1: probe Paperclip is alive ──
   setStatus({ state: 'connecting', message: 'בודק חיבור ל-Paperclip…' });
   let companies: PaperclipCompany[];
@@ -216,6 +366,8 @@ export async function startPaperclipApi(
     return null;
   }
   const company = companies[0]!;
+  moduleCompanyId = company.id;
+  moduleCompanyName = company.name;
   console.log(`[PaperclipApi] Connected to company: ${company.name} (${company.id})`);
 
   // ── Step 3: load initial agents and seed the office ──
@@ -228,30 +380,22 @@ export async function startPaperclipApi(
     console.warn('[PaperclipApi] Failed to load initial agents:', err);
   }
 
-  if (agents.length > 0) {
-    const numericIds: number[] = [];
-    const folderNames: Record<number, string> = {};
-    for (const a of agents) {
-      const id = idMapper.toNumeric(a.id);
-      numericIds.push(id);
-      folderNames[id] = a.name;
-    }
+  // GoBoost note: we previously used `existingAgents` for the bulk seed,
+  // but pixel-agents' handler BUFFERS those events into a `pendingAgents`
+  // list that's only drained inside `layoutLoaded`. browserMock dispatches
+  // layoutLoaded BEFORE we fetch agents, so the buffer was always empty by
+  // the time it drained — pre-existing agents never appeared.
+  // `agentCreated` has no such buffering: it calls `os.addAgent` immediately.
+  for (const a of agents) {
+    const numericId = idMapper.toNumeric(a.id);
     dispatch({
-      type: 'existingAgents',
-      agents: numericIds,
-      agentMeta: {},
-      folderNames,
+      type: 'agentCreated',
+      id: numericId,
+      folderName: a.name,
     });
-    // Apply current statuses
-    for (const a of agents) {
-      const mapped = mapPaperclipStatus(a.status);
-      if (mapped !== 'active') {
-        dispatch({
-          type: 'agentStatus',
-          id: idMapper.toNumeric(a.id),
-          status: mapped,
-        });
-      }
+    const mapped = mapPaperclipStatus(a.status);
+    if (mapped !== 'active') {
+      dispatch({ type: 'agentStatus', id: numericId, status: mapped });
     }
   }
 
@@ -379,8 +523,12 @@ export async function startPaperclipApi(
         return;
       }
 
-      // ── Activity log entries (agent created / deleted / etc.) ──
+      // ── Activity log entries (agent created / deleted / comment added) ──
       case 'activity.logged': {
+        // Fan-out to chat panel + future task panel subscribers first,
+        // before we apply our own agent lifecycle interpretations.
+        emitActivity(payload);
+
         const entityType = String(payload.entityType ?? '');
         const action = String(payload.action ?? '');
         const entityId = String(payload.entityId ?? '');

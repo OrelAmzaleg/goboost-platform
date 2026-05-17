@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { toMajorMinor } from './changelogData.js';
 import { BottomToolbar } from './components/BottomToolbar.js';
+import { WhatsAppPanel } from './components/WhatsAppPanel.js';
 import { ChangelogModal } from './components/ChangelogModal.js';
 import { DebugView } from './components/DebugView.js';
 import { EditActionBar } from './components/EditActionBar.js';
@@ -199,6 +200,15 @@ function App() {
     return <div className="w-full h-full flex items-center justify-center ">Loading...</div>;
   }
 
+  // GoBoost: name of the selected agent, read directly from the office state
+  // (folderName was set on addAgent). OfficeState is imperative, not React
+  // state, so this is a fresh read on every render — fine since names are
+  // assigned at agent creation and don't change.
+  const selectedAgentName =
+    selectedAgent != null
+      ? officeState.characters.get(selectedAgent)?.folderName ?? null
+      : null;
+
   return (
     <div ref={containerRef} className="w-full h-full relative overflow-hidden">
       <OfficeCanvas
@@ -217,6 +227,10 @@ function App() {
         onZoomChange={editor.handleZoomChange}
         panRef={editor.panRef}
       />
+
+      {/* GoBoost WhatsApp Chat Panel — Iteration 2.B.1.
+          Fixed right-side overlay; binds to currently-selected agent. */}
+      <WhatsAppPanel selectedAgentId={selectedAgent} selectedAgentName={selectedAgentName} />
 
       {!isDebugMode ? (
         <>
