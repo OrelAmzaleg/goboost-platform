@@ -90,6 +90,54 @@ function formatTime(iso: string): string {
   }
 }
 
+// Status color for the issue picker dot. Paperclip statuses:
+//   backlog/todo → cool gray (queued)
+//   in_progress  → blue
+//   in_review    → amber (waiting for sign-off)
+//   blocked      → orange (impeded)
+//   done         → green
+//   cancelled    → red/muted
+function statusColor(status: string): string {
+  switch (status) {
+    case 'in_progress':
+      return '#3b82f6';
+    case 'in_review':
+      return '#f59e0b';
+    case 'blocked':
+      return '#fb923c';
+    case 'done':
+      return '#22c55e';
+    case 'cancelled':
+      return '#dc2626';
+    case 'todo':
+    case 'backlog':
+    default:
+      return '#94a3b8';
+  }
+}
+
+// Hebrew label for the status (compact, for the picker rows).
+function statusLabel(status: string): string {
+  switch (status) {
+    case 'backlog':
+      return 'תור';
+    case 'todo':
+      return 'לעשות';
+    case 'in_progress':
+      return 'בעבודה';
+    case 'in_review':
+      return 'בבדיקה';
+    case 'blocked':
+      return 'חסום';
+    case 'done':
+      return 'הושלם';
+    case 'cancelled':
+      return 'בוטל';
+    default:
+      return status;
+  }
+}
+
 // Header icon button — small, minimal, white-on-purple-gradient.
 function IconButton({
   title,
@@ -155,6 +203,26 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const [collapsed, setCollapsed] = useState(() => readBoolPref(LS_COLLAPSED, false));
   const [fontScale, setFontScale] = useState<number>(() => readScalePref());
 
+  // Session picker (2.B.2.B) — dropdown of all issues assigned to the
+  // current agent. Closes on outside-click or when an item is selected.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerWrapRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const handler = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (pickerWrapRef.current && target && !pickerWrapRef.current.contains(target)) {
+        setPickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [pickerOpen]);
+  const onSelectIssue = useCallback((next: PaperclipIssue) => {
+    setIssue(next);
+    setPickerOpen(false);
+  }, []);
+
   useEffect(() => {
     try { localStorage.setItem(LS_COLLAPSED, collapsed ? '1' : '0'); } catch {}
   }, [collapsed]);
@@ -199,30 +267,48 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     setErrorText(null);
   }, [selectedAgentId]);
 
-  // Initial load: fetch agent's issues, pick the most-recent one, load its comments
+  // Effect A: when the selected agent changes, fetch their issue list and
+  // auto-select the most-recently-updated one. Comments load is delegated
+  // to Effect B so manual issue switching (via the session picker) shares
+  // the same code path as initial auto-select.
   useEffect(() => {
-    if (!agentUuid) return;
+    if (!agentUuid) {
+      setAllIssues([]);
+      setIssue(null);
+      return;
+    }
     let cancelled = false;
-    setLoading(true);
     (async () => {
       const issues = await fetchAgentIssues(agentUuid);
       if (cancelled) return;
       setAllIssues(issues);
-      const top = issues[0] ?? null;
-      setIssue(top);
-      if (top) {
-        const c = await fetchIssueComments(top.id);
-        if (cancelled) return;
-        setComments(c);
-      } else {
-        setComments([]);
-      }
-      setLoading(false);
+      setIssue(issues[0] ?? null);
     })();
     return () => {
       cancelled = true;
     };
   }, [agentUuid]);
+
+  // Effect B: whenever the active issue changes (auto-selected or
+  // operator-picked from the session navigator), fetch its comments.
+  useEffect(() => {
+    if (!issue) {
+      setComments([]);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      const c = await fetchIssueComments(issue.id);
+      if (cancelled) return;
+      setComments(c);
+      setLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [issue]);
 
   // Refresh comments when activity fires for our current issue
   useEffect(() => {
@@ -436,17 +522,196 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             </IconButton>
           </div>
         </div>
-        {/* Sub-row: issue title */}
-        <div style={{ fontSize: size(13), opacity: 0.9 }}>
-          {empty
-            ? 'לחץ על דמות במשרד כדי לפתוח שיחה'
-            : issue
-              ? `שיחה על: ${issue.title}`
-              : loading
-                ? 'טוען…'
-                : allIssues.length === 0
-                  ? 'אין issues פעילים לסוכן הזה'
-                  : '—'}
+        {/* Sub-row: session picker (issue identifier + title + dropdown).
+            When the agent has no issues, this collapses to a hint. When
+            there's exactly one issue we still render the picker chip
+            (consistent affordance + lets the user see the identifier). */}
+        <div style={{ position: 'relative' }} ref={pickerWrapRef}>
+          {empty ? (
+            <div style={{ fontSize: size(13), opacity: 0.9 }}>
+              לחץ על דמות במשרד כדי לפתוח שיחה
+            </div>
+          ) : !issue && allIssues.length === 0 ? (
+            <div style={{ fontSize: size(13), opacity: 0.9 }}>
+              אין issues פעילים לסוכן הזה
+            </div>
+          ) : !issue ? (
+            <div style={{ fontSize: size(13), opacity: 0.9 }}>—</div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setPickerOpen((o) => !o)}
+              title={`${issue.identifier ?? '—'} · ${issue.title}`}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                padding: '6px 10px',
+                background: 'rgba(255,255,255,0.08)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 8,
+                color: '#fff',
+                cursor: 'pointer',
+                textAlign: 'start',
+                fontFamily: 'inherit',
+                transition: 'background 0.15s',
+              }}
+              onMouseEnter={(e) => {
+                (e.currentTarget as HTMLButtonElement).style.background =
+                  'rgba(255,255,255,0.15)';
+              }}
+              onMouseLeave={(e) => {
+                (e.currentTarget as HTMLButtonElement).style.background =
+                  'rgba(255,255,255,0.08)';
+              }}
+            >
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  background: statusColor(issue.status),
+                  flexShrink: 0,
+                }}
+              />
+              <span
+                style={{
+                  fontSize: size(12),
+                  fontWeight: 700,
+                  background: 'rgba(0,0,0,0.25)',
+                  padding: '2px 6px',
+                  borderRadius: 4,
+                  flexShrink: 0,
+                  letterSpacing: 0.5,
+                }}
+              >
+                {issue.identifier ?? '—'}
+              </span>
+              <span
+                style={{
+                  fontSize: size(13),
+                  flex: 1,
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {issue.title}
+              </span>
+              <span style={{ fontSize: size(11), opacity: 0.7, flexShrink: 0 }}>
+                {allIssues.length > 1 ? `${allIssues.length} ${pickerOpen ? '▲' : '▼'}` : ''}
+              </span>
+            </button>
+          )}
+
+          {/* Dropdown: list of all agent's issues. Anchored below the chip. */}
+          {pickerOpen && allIssues.length > 0 ? (
+            <div
+              style={{
+                position: 'absolute',
+                top: 'calc(100% + 6px)',
+                insetInlineStart: 0,
+                insetInlineEnd: 0,
+                maxHeight: 320,
+                overflowY: 'auto',
+                background: '#1e293b',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 10,
+                boxShadow: '0 6px 18px rgba(0,0,0,0.45)',
+                zIndex: 200,
+                padding: 6,
+                color: '#e2e8f0',
+              }}
+            >
+              {allIssues.map((it) => {
+                const active = issue?.id === it.id;
+                return (
+                  <button
+                    key={it.id}
+                    type="button"
+                    onClick={() => onSelectIssue(it)}
+                    title={`${it.identifier ?? '—'} · ${it.title} · ${statusLabel(it.status)}`}
+                    style={{
+                      width: '100%',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '8px 10px',
+                      background: active ? 'rgba(99,102,241,0.25)' : 'transparent',
+                      border: active
+                        ? '1px solid rgba(129,140,248,0.6)'
+                        : '1px solid transparent',
+                      borderRadius: 7,
+                      color: '#e2e8f0',
+                      cursor: 'pointer',
+                      textAlign: 'start',
+                      fontFamily: 'inherit',
+                      marginBlockEnd: 2,
+                      transition: 'background 0.12s',
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!active)
+                        (e.currentTarget as HTMLButtonElement).style.background =
+                          'rgba(255,255,255,0.06)';
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!active)
+                        (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        background: statusColor(it.status),
+                        flexShrink: 0,
+                      }}
+                    />
+                    <span
+                      style={{
+                        fontSize: size(12),
+                        fontWeight: 700,
+                        background: 'rgba(255,255,255,0.08)',
+                        padding: '2px 6px',
+                        borderRadius: 4,
+                        flexShrink: 0,
+                        letterSpacing: 0.5,
+                      }}
+                    >
+                      {it.identifier ?? '—'}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: size(13),
+                        flex: 1,
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {it.title}
+                    </span>
+                    <span
+                      style={{
+                        fontSize: size(10),
+                        opacity: 0.7,
+                        flexShrink: 0,
+                        padding: '1px 5px',
+                        background: 'rgba(255,255,255,0.05)',
+                        borderRadius: 3,
+                      }}
+                    >
+                      {statusLabel(it.status)}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       </header>
 
