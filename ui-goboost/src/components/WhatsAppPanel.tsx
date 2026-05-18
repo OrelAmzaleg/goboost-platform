@@ -9,6 +9,7 @@ import {
   type PaperclipComment,
   type PaperclipIssue,
 } from '../paperclipApi.js';
+import { TasksPanel } from './TasksPanel.js';
 
 /**
  * GoBoost WhatsApp Chat Panel.
@@ -203,6 +204,11 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const [collapsed, setCollapsed] = useState(() => readBoolPref(LS_COLLAPSED, false));
   const [fontScale, setFontScale] = useState<number>(() => readScalePref());
 
+  // Tasks Panel (2.B.2.D) — drawer that slides in next to the chat panel
+  // showing the issue tree + steps + criteria for the active issue.
+  const [tasksOpen, setTasksOpen] = useState(false);
+  const onToggleTasks = useCallback(() => setTasksOpen((o) => !o), []);
+
   // Session picker (2.B.2.B) — dropdown of all issues assigned to the
   // current agent. Closes on outside-click or when an item is selected.
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -365,6 +371,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   // ── Collapsed strip ────────────────────────────────────────────────────────
   if (collapsed) {
     return (
+      <>
       <aside
         dir="rtl"
         className="gb-chat-panel-scope"
@@ -446,11 +453,20 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           </div>
         ) : null}
       </aside>
+      <TasksPanel
+        issue={issue}
+        isOpen={tasksOpen}
+        onClose={() => setTasksOpen(false)}
+        chatCollapsed={true}
+        size={size}
+      />
+      </>
     );
   }
 
   // ── Expanded panel ────────────────────────────────────────────────────────
   return (
+    <>
     <aside
       dir="rtl"
       className="gb-chat-panel-scope"
@@ -503,6 +519,36 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             {empty ? 'בחר סוכן במשרד' : agentName}
           </div>
           <div style={{ display: 'inline-flex', gap: 4, flexShrink: 0 }}>
+            <button
+              type="button"
+              title={tasksOpen ? 'סגור תוכנית' : 'פתח תוכנית'}
+              aria-label={tasksOpen ? 'סגור תוכנית' : 'פתח תוכנית'}
+              onClick={onToggleTasks}
+              disabled={empty || !issue}
+              style={{
+                height: 28,
+                paddingInline: 10,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                background: tasksOpen
+                  ? 'rgba(255,255,255,0.28)'
+                  : 'rgba(255,255,255,0.12)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 7,
+                cursor: empty || !issue ? 'not-allowed' : 'pointer',
+                opacity: empty || !issue ? 0.4 : 1,
+                fontFamily: 'inherit',
+                fontSize: 12,
+                fontWeight: 700,
+                lineHeight: 1,
+                transition: 'background 0.15s',
+              }}
+            >
+              <span style={{ fontSize: 13 }}>📋</span>
+              <span>תוכנית</span>
+            </button>
             <IconButton
               title="הקטן גופנים"
               onClick={onScaleDown}
@@ -878,5 +924,13 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
         </button>
       </footer>
     </aside>
+    <TasksPanel
+      issue={issue}
+      isOpen={tasksOpen}
+      onClose={() => setTasksOpen(false)}
+      chatCollapsed={false}
+      size={size}
+    />
+    </>
   );
 }

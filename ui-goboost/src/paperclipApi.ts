@@ -51,6 +51,10 @@ let moduleBaseUrl = DEFAULT_PAPERCLIP_BASE;
 let moduleCompanyId: string | null = null;
 let moduleCompanyName: string | null = null;
 let moduleIdMapper: IdMapper | null = null;
+// Lookup table for agent names — populated on bootstrap and updated on
+// every activity.logged for agents (create/delete). Used by the Tasks
+// Panel to render assignee names instead of raw UUIDs.
+const agentNameByUuid = new Map<string, string>();
 
 // Activity event subscribers — used by the chat panel to refresh on
 // `activity.logged` events (new comment, etc.).
@@ -250,6 +254,47 @@ export async function fetchIssueComments(issueId: string): Promise<PaperclipComm
 }
 
 /**
+ * List the direct child issues of a parent — used by the Tasks Panel to
+ * render the issue tree (steps under a plan).
+ */
+export async function fetchIssueChildren(parentIssueId: string): Promise<PaperclipIssue[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues?parentId=${encodeURIComponent(parentIssueId)}&limit=200`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipIssue[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { issues?: unknown }).issues)) {
+      return (raw as { issues: PaperclipIssue[] }).issues;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueChildren failed:', err);
+    return [];
+  }
+}
+
+/** Fetch a single issue by id — used for parent breadcrumbs in the Tasks Panel. */
+export async function fetchIssueById(issueId: string): Promise<PaperclipIssue | null> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipIssue;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueById failed:', err);
+    return null;
+  }
+}
+
+/** Look up a cached agent display name. Returns null if unknown. */
+export function getAgentName(uuid: string | null | undefined): string | null {
+  if (!uuid) return null;
+  return agentNameByUuid.get(uuid) ?? null;
+}
+
+/**
  * Post a new comment to an issue as the human board user. The backend
  * (`POST /api/issues/:id/comments`) records it, fires activity.logged on
  * the WS, and the chat panel picks it up via subscribeActivity.
@@ -394,6 +439,7 @@ export async function startPaperclipApi(
   // `agentCreated` has no such buffering: it calls `os.addAgent` immediately.
   for (const a of agents) {
     const numericId = idMapper.toNumeric(a.id);
+    agentNameByUuid.set(a.id, a.name);
     dispatch({
       type: 'agentCreated',
       id: numericId,
@@ -480,6 +526,7 @@ export async function startPaperclipApi(
     try {
       const a = await fetchJson<PaperclipAgent>(`${baseUrl}/api/agents/${uuid}`);
       const numericId = idMapper.toNumeric(a.id);
+      agentNameByUuid.set(a.id, a.name);
       dispatch({
         type: 'agentCreated',
         id: numericId,
@@ -544,6 +591,7 @@ export async function startPaperclipApi(
           void refetchAgentAndDispatchCreate(entityId);
         } else if (/delete|removed|terminated/i.test(action)) {
           const numericId = idMapper.forget(entityId);
+          agentNameByUuid.delete(entityId);
           if (numericId !== undefined) {
             dispatch({ type: 'agentClosed', id: numericId });
           }
