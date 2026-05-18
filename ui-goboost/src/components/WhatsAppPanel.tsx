@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
+  createIssue,
   fetchAgentIssues,
   fetchIssueComments,
   postIssueComment,
   subscribeActivity,
+  subscribeHeartbeatEvents,
   uuidForNumericAgentId,
   type PaperclipComment,
+  type PaperclipHeartbeatEvent,
   type PaperclipIssue,
 } from '../paperclipApi.js';
 import { TasksPanel } from './TasksPanel.js';
@@ -73,11 +76,17 @@ interface BubbleAuthor {
 }
 
 function authorFor(comment: PaperclipComment, fallbackAgentName: string): BubbleAuthor {
-  if (comment.authorType === 'user' || comment.authorUserId) {
-    return { type: 'human', name: 'אני' };
-  }
-  if (comment.authorType === 'agent' || comment.authorAgentId) {
+  // Classification order matters: in Paperclip's local_trusted mode the
+  // local-board user is recorded as the actor even for content the agent
+  // produced during a heartbeat run. The most reliable signal that this
+  // is *agent content* is `createdByRunId` — runs only exist as part of
+  // an agent's execution loop. authorAgentId is also a positive signal.
+  // We check those FIRST, then fall back to plain authorUserId/authorType.
+  if (comment.authorAgentId || comment.createdByRunId) {
     return { type: 'agent', name: fallbackAgentName };
+  }
+  if (comment.authorUserId || comment.authorType === 'user') {
+    return { type: 'human', name: 'אני' };
   }
   return { type: 'system', name: 'מערכת' };
 }
@@ -209,6 +218,25 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const [tasksOpen, setTasksOpen] = useState(false);
   const onToggleTasks = useCallback(() => setTasksOpen((o) => !o), []);
 
+  // Ephemeral "thinking" feed (2.B.2.E rework of 2.B.2.C) — heartbeat run
+  // events arrive from the WS and represent the agent's internal lifecycle
+  // ("inner voice"). Rather than persistent bubbles in a separate tab,
+  // these are rendered as a single transient strip above the input —
+  // showing only the LATEST event, swapping in place — exactly like a
+  // "Thinking…" indicator in Claude Code. We keep a small ring of recent
+  // ones in state so a brief hover or scroll-back can reveal context.
+  const [heartbeatEvents, setHeartbeatEvents] = useState<PaperclipHeartbeatEvent[]>([]);
+
+  // Clear the feed on context switch.
+  useEffect(() => {
+    setHeartbeatEvents([]);
+  }, [selectedAgentId, issue?.id]);
+
+  // The subscription + timeline merge depend on `agentUuid`, which is
+  // declared just below as a useMemo over selectedAgentId. We can't
+  // forward-reference `agentUuid` in this block, so the actual
+  // subscribe useEffect and the timeline useMemo live AFTER agentUuid.
+
   // Session picker (2.B.2.B) — dropdown of all issues assigned to the
   // current agent. Closes on outside-click or when an item is selected.
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -228,6 +256,17 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     setIssue(next);
     setPickerOpen(false);
   }, []);
+
+  // "+ שיחה חדשה" — transparent flow per user spec (2.B.2.E #1): visible
+  // only when an agent is selected; click immediately creates a fresh
+  // issue assigned to that agent and switches the chat thread to it.
+  // No modal, no fields — the operator's mental model is "start a new
+  // conversation", not "fill an issue form". Title is auto-generated;
+  // can be edited later in Paperclip's classic UI if needed.
+  // onNewConversation is declared LOWER — after agentUuid/agentName,
+  // which are computed in the agent-resolution block below. Keeping it
+  // up here would forward-reference and trip TS source-order checks.
+  const [creatingConversation, setCreatingConversation] = useState(false);
 
   useEffect(() => {
     try { localStorage.setItem(LS_COLLAPSED, collapsed ? '1' : '0'); } catch {}
@@ -263,6 +302,97 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     () => (selectedAgentId == null ? null : uuidForNumericAgentId(selectedAgentId)),
     [selectedAgentId],
   );
+
+  // "+ שיחה חדשה" — declared HERE because it depends on agentUuid/agentName
+  // computed just above. Transparent flow: no modal, no fields. Click →
+  // create a fresh issue assigned to the active agent → switch the chat
+  // thread to it. Auto-titled with timestamp; renameable later in
+  // Paperclip's classic UI if the operator cares.
+  const onNewConversation = useCallback(async () => {
+    if (!agentUuid || creatingConversation) return;
+    setCreatingConversation(true);
+    try {
+      const stamp = new Date().toLocaleString('he-IL', {
+        day: '2-digit',
+        month: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const title = `שיחה · ${agentName} · ${stamp}`;
+      const newIssue = await createIssue({
+        title,
+        description: '',
+        assigneeAgentId: agentUuid,
+        status: 'todo',
+      });
+      if (newIssue) {
+        setAllIssues((prev) => [newIssue, ...prev]);
+        setIssue(newIssue);
+        setPickerOpen(false);
+      }
+    } finally {
+      setCreatingConversation(false);
+    }
+  }, [agentUuid, agentName, creatingConversation]);
+
+  // Subscribe to heartbeat events whenever there's an agent in focus.
+  // Declared here (not next to setHeartbeatEvents above) because it
+  // needs `agentUuid` which is computed just above. We cap the ring at
+  // 30 events to avoid unbounded growth — the "thinking" indicator only
+  // shows the most recent one anyway.
+  useEffect(() => {
+    if (!agentUuid) return;
+    const unsubscribe = subscribeHeartbeatEvents((event) => {
+      if (event.agentId !== agentUuid) return;
+      setHeartbeatEvents((prev) => {
+        const next = [...prev, event];
+        return next.length > 30 ? next.slice(next.length - 30) : next;
+      });
+    });
+    return unsubscribe;
+  }, [agentUuid]);
+
+  // Most-recent event for the transient "thinking…" indicator.
+  const latestHeartbeatEvent = heartbeatEvents.length > 0
+    ? heartbeatEvents[heartbeatEvents.length - 1]
+    : null;
+
+  // Merged timeline used by the bubble renderer below.
+  //
+  // Order:
+  //   1. The issue itself, rendered as a SYNTHETIC first bubble. The
+  //      issue's description is the opening context of the conversation —
+  //      this used to live only in the Tasks Panel, but operators kept
+  //      missing it. By prepending it here the chat reads end-to-end:
+  //      "what was asked → agent responses → user follow-ups".
+  //   2. issue_comments (always).
+  //   3. heartbeat events — system "inner voice" — surfaced as compact
+  //      centered badges (2c). NOTE: as of 2.B.2.E the persistent tab
+  //      toggle has been removed; events render inline as badges in the
+  //      regular flow, plus a transient "thinking…" indicator below the
+  //      bubble area (4).
+  type TimelineItem =
+    | { kind: 'origin'; key: string; createdAt: string }
+    | { kind: 'comment'; key: string; createdAt: string; comment: PaperclipComment };
+  const timeline = useMemo<TimelineItem[]>(() => {
+    const items: TimelineItem[] = [];
+    if (issue && (issue.description?.trim() || issue.title)) {
+      items.push({
+        kind: 'origin',
+        key: `o:${issue.id}`,
+        createdAt: issue.createdAt,
+      });
+    }
+    for (const c of comments) {
+      items.push({
+        kind: 'comment',
+        key: `c:${c.id}`,
+        createdAt: c.createdAt,
+        comment: c,
+      });
+    }
+    return items.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  }, [comments, issue]);
 
   // Reset state when a different agent is selected
   useEffect(() => {
@@ -568,31 +698,33 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             </IconButton>
           </div>
         </div>
-        {/* Sub-row: session picker (issue identifier + title + dropdown).
-            When the agent has no issues, this collapses to a hint. When
-            there's exactly one issue we still render the picker chip
-            (consistent affordance + lets the user see the identifier). */}
-        <div style={{ position: 'relative' }} ref={pickerWrapRef}>
+        {/* Sub-row: session picker chip + "+ שיחה חדשה" button.
+            When no agent is selected we show a hint. Otherwise the chip
+            (if there's an active issue) and the new-conversation button
+            sit side by side; the button is the operator's one-click way
+            to start a fresh chat with the selected agent — under the
+            hood it creates a new issue and switches the thread. */}
+        <div
+          style={{ position: 'relative', display: 'flex', gap: 6, alignItems: 'stretch' }}
+          ref={pickerWrapRef}
+        >
           {empty ? (
-            <div style={{ fontSize: size(13), opacity: 0.9 }}>
+            <div style={{ fontSize: size(13), opacity: 0.9, flex: 1 }}>
               לחץ על דמות במשרד כדי לפתוח שיחה
             </div>
-          ) : !issue && allIssues.length === 0 ? (
-            <div style={{ fontSize: size(13), opacity: 0.9 }}>
-              אין issues פעילים לסוכן הזה
-            </div>
-          ) : !issue ? (
-            <div style={{ fontSize: size(13), opacity: 0.9 }}>—</div>
           ) : (
-            <button
-              type="button"
-              onClick={() => setPickerOpen((o) => !o)}
-              title={`${issue.identifier ?? '—'} · ${issue.title}`}
-              style={{
-                width: '100%',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
+            <>
+              {issue ? (
+                <button
+                  type="button"
+                  onClick={() => setPickerOpen((o) => !o)}
+                  title={`${issue.identifier ?? '—'} · ${issue.title}`}
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
                 padding: '6px 10px',
                 background: 'rgba(255,255,255,0.08)',
                 border: '1px solid rgba(255,255,255,0.12)',
@@ -650,6 +782,48 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                 {allIssues.length > 1 ? `${allIssues.length} ${pickerOpen ? '▲' : '▼'}` : ''}
               </span>
             </button>
+              ) : null}
+              {/* + שיחה חדשה — transparent create-new-issue button, shown
+                  only when an agent is in focus. Click → POST a fresh
+                  issue assigned to this agent → switch the thread to it. */}
+              <button
+                type="button"
+                onClick={() => void onNewConversation()}
+                disabled={creatingConversation}
+                title="פתח שיחה חדשה עם הסוכן"
+                aria-label="פתח שיחה חדשה עם הסוכן"
+                style={{
+                  flexShrink: 0,
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4,
+                  padding: '6px 10px',
+                  background: 'rgba(34,197,94,0.18)',
+                  border: '1px solid rgba(34,197,94,0.45)',
+                  borderRadius: 8,
+                  color: '#dcfce7',
+                  cursor: creatingConversation ? 'not-allowed' : 'pointer',
+                  opacity: creatingConversation ? 0.6 : 1,
+                  fontFamily: 'inherit',
+                  fontSize: size(12),
+                  fontWeight: 700,
+                  whiteSpace: 'nowrap',
+                  transition: 'background 0.15s',
+                }}
+                onMouseEnter={(e) => {
+                  if (!creatingConversation)
+                    (e.currentTarget as HTMLButtonElement).style.background =
+                      'rgba(34,197,94,0.28)';
+                }}
+                onMouseLeave={(e) => {
+                  (e.currentTarget as HTMLButtonElement).style.background =
+                    'rgba(34,197,94,0.18)';
+                }}
+              >
+                <span style={{ fontSize: size(13) }}>＋</span>
+                <span>{creatingConversation ? 'פותח…' : 'שיחה חדשה'}</span>
+              </button>
+            </>
           )}
 
           {/* Dropdown: list of all agent's issues. Anchored below the chip. */}
@@ -784,7 +958,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           >
             טוען היסטוריה…
           </div>
-        ) : comments.length === 0 ? (
+        ) : timeline.length === 0 ? (
           <div
             style={{
               textAlign: 'center',
@@ -796,21 +970,154 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           >
             {issue
               ? 'אין הודעות עדיין בשיחה הזו. שלח את הראשונה.'
-              : 'אין issue פעיל. צור issue ב-Paperclip ב-:3100 והקצה אותו לסוכן.'}
+              : 'אין שיחה פעילה. לחץ "+ שיחה חדשה" למעלה כדי להתחיל.'}
           </div>
         ) : (
-          comments.map((c) => {
+          timeline.map((item) => {
+            // ── Origin bubble: the issue's own title + description, shown
+            // as the conversation opener. Side/color matches who created
+            // the issue (user → green outgoing, agent → gray incoming). ──
+            if (item.kind === 'origin' && issue) {
+              const fromUser = !!issue.createdByUserId && !issue.createdByAgentId;
+              return (
+                <div
+                  key={item.key}
+                  style={{
+                    alignSelf: fromUser ? 'flex-start' : 'flex-end',
+                    maxWidth: '85%',
+                    background: fromUser ? '#16a34a' : '#cbd5e1',
+                    color: fromUser ? '#fff' : '#0f172a',
+                    padding: '10px 13px',
+                    borderRadius: 12,
+                    borderTopRightRadius: fromUser ? 12 : 3,
+                    borderTopLeftRadius: fromUser ? 3 : 12,
+                    fontSize: size(15),
+                    lineHeight: 1.55,
+                    boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: size(11),
+                      opacity: 0.75,
+                      marginBottom: 4,
+                      fontWeight: 700,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                    }}
+                  >
+                    <span
+                      style={{
+                        background: 'rgba(0,0,0,0.18)',
+                        padding: '1px 5px',
+                        borderRadius: 3,
+                        letterSpacing: 0.4,
+                      }}
+                    >
+                      {issue.identifier ?? '—'}
+                    </span>
+                    <span>פתיחת השיחה</span>
+                  </div>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>{issue.title}</div>
+                  {issue.description?.trim() ? <div>{issue.description}</div> : null}
+                  <div
+                    style={{
+                      fontSize: size(11),
+                      opacity: 0.6,
+                      marginTop: 6,
+                      textAlign: 'start',
+                    }}
+                  >
+                    {formatTime(issue.createdAt)}
+                  </div>
+                </div>
+              );
+            }
+            if (item.kind !== 'comment') return null;
+
+            const c = item.comment;
             const author = authorFor(c, agentName);
             const isHuman = author.type === 'human';
             const isSystem = author.type === 'system';
+
+            // ── System comments — small centered badge with hover tooltip. ──
+            // Per user spec (2.B.2.E): Paperclip "system" messages
+            // (questionnaires, dispositions, control-plane notices) are
+            // operationally important but visually shouldn't compete with
+            // dialog bubbles. Render as a compact pill with an ⓘ icon —
+            // hover reveals the full body.
+            if (isSystem) {
+              return (
+                <div
+                  key={item.key}
+                  title={c.body}
+                  style={{
+                    alignSelf: 'center',
+                    maxWidth: '88%',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    background: 'rgba(71,85,105,0.55)',
+                    color: '#e2e8f0',
+                    padding: '4px 10px',
+                    borderRadius: 999,
+                    fontSize: size(11),
+                    lineHeight: 1.4,
+                    cursor: 'help',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                  }}
+                >
+                  <span
+                    aria-hidden
+                    style={{
+                      width: 14,
+                      height: 14,
+                      borderRadius: '50%',
+                      background: 'rgba(255,255,255,0.18)',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: size(10),
+                      fontWeight: 700,
+                    }}
+                  >
+                    ⓘ
+                  </span>
+                  <span
+                    style={{
+                      maxWidth: 240,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {c.body}
+                  </span>
+                  <span
+                    style={{
+                      fontSize: size(10),
+                      opacity: 0.65,
+                      marginInlineStart: 4,
+                    }}
+                  >
+                    {formatTime(c.createdAt)}
+                  </span>
+                </div>
+              );
+            }
+
+            // ── Regular dialog bubble (human/agent). ──
             return (
               <div
-                key={c.id}
+                key={item.key}
                 style={{
                   alignSelf: isHuman ? 'flex-start' : 'flex-end',
                   maxWidth: '85%',
-                  background: isHuman ? '#16a34a' : isSystem ? '#475569' : '#e2e8f0',
-                  color: isHuman ? '#fff' : isSystem ? '#e2e8f0' : '#0f172a',
+                  background: isHuman ? '#16a34a' : '#cbd5e1',
+                  color: isHuman ? '#fff' : '#0f172a',
                   padding: '10px 13px',
                   borderRadius: 12,
                   borderTopRightRadius: isHuman ? 12 : 3,
@@ -848,6 +1155,65 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           })
         )}
       </div>
+
+      {/* Thinking strip (2.B.2.E rework) — transient indicator that
+          shows the latest heartbeat event from the active agent. This
+          replaces the old persistent "All Activity" tab. Each new event
+          swaps the visible text in place, mimicking Claude Code's
+          "Thinking…" indicator. Vanishes when there are no events for
+          the active agent (e.g. context switch, or once activity calms). */}
+      {latestHeartbeatEvent && !empty ? (
+        <div
+          title={
+            latestHeartbeatEvent.message ??
+            (latestHeartbeatEvent.payload
+              ? JSON.stringify(latestHeartbeatEvent.payload)
+              : '')
+          }
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '6px 14px',
+            background: 'rgba(15,23,42,0.6)',
+            borderBlockStart: '1px solid rgba(255,255,255,0.06)',
+            color: '#cbd5e1',
+            fontSize: size(12),
+            fontStyle: 'italic',
+            lineHeight: 1.4,
+          }}
+        >
+          <span
+            aria-hidden
+            style={{
+              fontSize: size(13),
+              animation: 'pixel-pulse 1.5s ease-in-out infinite',
+            }}
+          >
+            💭
+          </span>
+          <span
+            style={{
+              flex: 1,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontStyle: 'normal',
+              opacity: 0.85,
+            }}
+          >
+            <span style={{ fontWeight: 700, marginInlineEnd: 4 }}>
+              {latestHeartbeatEvent.eventType}
+              {latestHeartbeatEvent.level ? ` · ${latestHeartbeatEvent.level}` : ''}
+            </span>
+            {latestHeartbeatEvent.message ?? ''}
+          </span>
+          <span style={{ fontSize: size(10), opacity: 0.55, flexShrink: 0 }}>
+            {formatTime(latestHeartbeatEvent.createdAt)}
+          </span>
+        </div>
+      ) : null}
 
       {/* Error strip */}
       {errorText ? (

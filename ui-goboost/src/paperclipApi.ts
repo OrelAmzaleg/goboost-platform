@@ -76,6 +76,42 @@ function emitActivity(payload: Record<string, unknown>): void {
   }
 }
 
+// Heartbeat-event subscribers (2.B.2.C) — the chat panel's "כל הפעילות"
+// mode listens here to splice agent internal lifecycle events into the
+// timeline. These come from Paperclip's `heartbeat.run.event` WS type
+// (run lifecycle, errors, etc.) — they are the system "inner voice" of
+// the agent, distinct from user/agent dialog comments.
+export interface PaperclipHeartbeatEvent {
+  agentId: string;
+  runId: string;
+  seq: number;
+  eventType: string; // 'lifecycle' | 'error' | (others in the future)
+  stream: string | null;
+  level: string | null; // 'info' | 'warn' | 'error' | ...
+  color: string | null;
+  message: string | null;
+  payload: Record<string, unknown> | null;
+  createdAt: string; // ISO timestamp from the live event envelope
+}
+
+type HeartbeatEventListener = (event: PaperclipHeartbeatEvent) => void;
+const heartbeatListeners = new Set<HeartbeatEventListener>();
+
+export function subscribeHeartbeatEvents(listener: HeartbeatEventListener): () => void {
+  heartbeatListeners.add(listener);
+  return () => heartbeatListeners.delete(listener);
+}
+
+function emitHeartbeatEvent(event: PaperclipHeartbeatEvent): void {
+  for (const fn of heartbeatListeners) {
+    try {
+      fn(event);
+    } catch (err) {
+      console.warn('[PaperclipApi] heartbeat listener threw:', err);
+    }
+  }
+}
+
 // ── State for the banner indicator ────────────────────────────────────────
 
 export type PaperclipConnectionState =
@@ -129,6 +165,8 @@ export interface PaperclipIssue {
   priority?: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  createdByAgentId: string | null;
+  createdByUserId: string | null;
   identifier?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -141,6 +179,13 @@ export interface PaperclipComment {
   authorAgentId: string | null;
   authorUserId: string | null;
   authorType: string | null; // 'agent' | 'user' | 'system' | ...
+  /**
+   * When set, this comment was produced during an agent heartbeat run —
+   * i.e. it's agent-generated content, even if Paperclip's local_trusted
+   * mode attributed it to the `local-board` user. Used by the chat panel
+   * to classify the bubble correctly.
+   */
+  createdByRunId: string | null;
   body: string;
   createdAt: string;
   updatedAt: string;
@@ -292,6 +337,47 @@ export async function fetchIssueById(issueId: string): Promise<PaperclipIssue | 
 export function getAgentName(uuid: string | null | undefined): string | null {
   if (!uuid) return null;
   return agentNameByUuid.get(uuid) ?? null;
+}
+
+/**
+ * Create a new issue assigned to an agent — used by the "+" button in
+ * the chat panel to start a brand-new conversation. We intentionally
+ * keep the title minimal and the description empty: from the operator's
+ * POV this is "open a new chat with X", not "fill an issue form".
+ * The issue can always be renamed later in Paperclip's classic UI.
+ */
+export async function createIssue(args: {
+  title: string;
+  description?: string;
+  assigneeAgentId: string;
+  /** Status to start in. Defaults to 'todo' so heartbeats may pick it up. */
+  status?: string;
+}): Promise<PaperclipIssue | null> {
+  if (!moduleCompanyId) {
+    console.warn('[PaperclipApi] createIssue called before company is known');
+    return null;
+  }
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: args.title,
+        description: args.description ?? '',
+        assigneeAgentId: args.assigneeAgentId,
+        status: args.status ?? 'todo',
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipIssue;
+  } catch (err) {
+    console.warn('[PaperclipApi] createIssue failed:', err);
+    return null;
+  }
 }
 
 /**
@@ -599,8 +685,26 @@ export async function startPaperclipApi(
         return;
       }
 
+      // ── Heartbeat run event — system "inner voice" of the agent (2.B.2.C) ──
+      // We fan out to subscribers; the chat panel's "כל הפעילות" view splices
+      // these into the same scrollable timeline alongside issue_comments.
+      case 'heartbeat.run.event': {
+        emitHeartbeatEvent({
+          agentId: String(payload.agentId ?? ''),
+          runId: String(payload.runId ?? ''),
+          seq: Number(payload.seq ?? 0),
+          eventType: String(payload.eventType ?? ''),
+          stream: (payload.stream as string | null) ?? null,
+          level: (payload.level as string | null) ?? null,
+          color: (payload.color as string | null) ?? null,
+          message: (payload.message as string | null) ?? null,
+          payload: (payload.payload as Record<string, unknown> | null) ?? null,
+          createdAt: event.createdAt,
+        });
+        return;
+      }
+
       // ── Intentionally ignored for v1 ──
-      case 'heartbeat.run.event':
       case 'heartbeat.run.log':
       case 'plugin.ui.updated':
       case 'plugin.worker.crashed':
