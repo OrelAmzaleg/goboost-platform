@@ -333,12 +333,18 @@ export async function startPaperclipApi(
 ): Promise<PaperclipApiHandle | null> {
   const baseUrl = opts.baseUrl ?? DEFAULT_PAPERCLIP_BASE;
   const setStatus = opts.onStatusChange ?? (() => {});
-  const idMapper = new IdMapper();
+
+  // GoBoost: reuse the existing IdMapper if one is already populated so
+  // numeric ids stay stable across React StrictMode double-invokes and
+  // across WS reconnects. Fresh start only when there's nothing to keep.
+  if (!moduleIdMapper) {
+    moduleIdMapper = new IdMapper();
+  }
+  const idMapper = moduleIdMapper;
 
   // Publish to module-level singletons so chat panel + future task panel
   // helpers (fetchAgentIssues, postIssueComment, ...) can read them.
   moduleBaseUrl = baseUrl;
-  moduleIdMapper = idMapper;
 
   // ── Step 1: probe Paperclip is alive ──
   setStatus({ state: 'connecting', message: 'בודק חיבור ל-Paperclip…' });

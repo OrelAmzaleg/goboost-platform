@@ -41,18 +41,27 @@ function App() {
   // then connect to Paperclip via paperclipApi for live agent events.
   // The two are complementary: browserMock loads sprites/floors/walls/layout
   // (which never come from Paperclip), and paperclipApi loads live agents.
+  //
+  // React StrictMode invokes effects twice in dev. Without cleanup, two
+  // paperclipApi instances run in parallel — each opens its own WebSocket
+  // and overwrites the module-level IdMapper, which races against the chat
+  // panel's UUID lookups. The cleanup below stops the first instance before
+  // the second initializes.
   useEffect(() => {
     if (!isBrowserRuntime) return;
 
+    let stopped = false;
+    let handle: import('./paperclipApi.js').PaperclipApiHandle | null = null;
+
     void (async () => {
       const { dispatchMockMessages } = await import('./browserMock.js');
+      if (stopped) return;
       dispatchMockMessages();
-      // Hand off to Paperclip after the asset/layout messages have been
-      // dispatched, so the office is ready to receive agent events.
       const { startPaperclipApi } = await import('./paperclipApi.js');
+      if (stopped) return;
       const baseUrl =
         (import.meta.env.VITE_PAPERCLIP_API_URL as string | undefined) ?? undefined;
-      void startPaperclipApi({
+      handle = await startPaperclipApi({
         baseUrl,
         onStatusChange: (status) => {
           // Reflect connection status into the bootstrap banner so the operator
@@ -73,7 +82,15 @@ function App() {
           el.textContent = `${dot} ${status.message}`;
         },
       });
+      // If cleanup ran while we were awaiting startPaperclipApi, stop the
+      // handle we just got.
+      if (stopped && handle) handle.stop();
     })();
+
+    return () => {
+      stopped = true;
+      if (handle) handle.stop();
+    };
   }, []);
 
   const editor = useEditorActions(getOfficeState, editorState);
@@ -170,6 +187,15 @@ function App() {
     const meta = os.subagentMeta.get(agentId);
     const focusId = meta ? meta.parentAgentId : agentId;
     vscode.postMessage({ type: 'focusAgent', id: focusId });
+    // GoBoost: in browser mode the vscode.postMessage above is a no-op stub —
+    // pixel-agents was designed so the VS Code extension would observe the
+    // focusAgent message, focus the Claude Code terminal, then reply with
+    // `agentSelected` which updates React state. Without an extension on the
+    // other end, selectedAgent never moves. We dispatch agentSelected locally
+    // so the chat panel reacts to clicks.
+    window.dispatchEvent(
+      new MessageEvent('message', { data: { type: 'agentSelected', id: focusId } }),
+    );
   }, []);
 
   const officeState = getOfficeState();
