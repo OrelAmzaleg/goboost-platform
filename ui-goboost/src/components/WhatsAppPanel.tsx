@@ -11,17 +11,16 @@ import {
 } from '../paperclipApi.js';
 
 /**
- * GoBoost WhatsApp Chat Panel (Iteration 2.B.1).
+ * GoBoost WhatsApp Chat Panel.
  *
- * Right-side floating panel: a single conversation with the agent currently
- * selected in the office canvas. Shows comments on that agent's most
- * recently updated issue. Sending writes a comment back through Paperclip.
+ * Iteration 2.B.1 — basic chat with selected agent's most-recent issue.
+ * Iteration 2.B.2.A — UX polish: collapsible, font scale, font family,
+ *   minimal icon-only controls in the header.
  *
- * Layered in 2.B.2/.3 (separate iterations):
- *   - Task panel (issue tree + success criteria) — triggered by the
- *     "View plan" link in the header strip.
- *   - Office speech bubbles for Layer 3 (per-action narration) — purely
- *     office overlay, not in this panel.
+ * Layered in 2.B.2.B/.C/.D (separate sub-iterations):
+ *   - Session navigator (multi-issue picker)
+ *   - Message type separation (system events tab)
+ *   - Tasks Panel (issue tree + criteria)
  */
 export interface WhatsAppPanelProps {
   /** Pixel-agents numeric id of the selected agent, or null when none. */
@@ -29,6 +28,43 @@ export interface WhatsAppPanelProps {
   /** Display name of the selected agent (from useExtensionMessages). */
   selectedAgentName?: string | null;
 }
+
+// ── User preferences (persisted in localStorage) ────────────────────────────
+
+const LS_COLLAPSED = 'goboost.panel.collapsed';
+const LS_FONT_SCALE = 'goboost.panel.fontScale';
+
+// Font scale levels — 7 steps for fine-grained control, including a smaller
+// option (0.7) per user request. Center = 1.0.
+const FONT_SCALES = [0.7, 0.85, 1.0, 1.15, 1.3, 1.5, 1.7] as const;
+const DEFAULT_FONT_SCALE = 1.0;
+
+// Single font family — Heebo. The earlier multi-font cycler was removed:
+// in practice Heebo covers every legibility case and the toggle didn't
+// add operational value.
+const PANEL_FONT_STACK = "'Heebo', system-ui, -apple-system, sans-serif";
+
+function readBoolPref(key: string, fallback: boolean): boolean {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    return raw === '1';
+  } catch {
+    return fallback;
+  }
+}
+function readScalePref(): number {
+  try {
+    const raw = localStorage.getItem(LS_FONT_SCALE);
+    const n = raw == null ? NaN : Number.parseFloat(raw);
+    return FONT_SCALES.includes(n as (typeof FONT_SCALES)[number])
+      ? n
+      : DEFAULT_FONT_SCALE;
+  } catch {
+    return DEFAULT_FONT_SCALE;
+  }
+}
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 interface BubbleAuthor {
   type: 'human' | 'agent' | 'system';
@@ -54,7 +90,59 @@ function formatTime(iso: string): string {
   }
 }
 
+// Header icon button — small, minimal, white-on-purple-gradient.
+function IconButton({
+  title,
+  onClick,
+  children,
+  disabled,
+}: {
+  title: string;
+  onClick: () => void;
+  children: React.ReactNode;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-label={title}
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        width: 28,
+        height: 28,
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'rgba(255,255,255,0.12)',
+        color: '#fff',
+        border: 'none',
+        borderRadius: 7,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.4 : 1,
+        fontFamily: 'inherit',
+        fontSize: 13,
+        fontWeight: 700,
+        lineHeight: 1,
+        transition: 'background 0.15s',
+      }}
+      onMouseEnter={(e) => {
+        if (!disabled) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.22)';
+      }}
+      onMouseLeave={(e) => {
+        (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.12)';
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────────────────────
+
 export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPanelProps) {
+  // Chat state
   const [issue, setIssue] = useState<PaperclipIssue | null>(null);
   const [allIssues, setAllIssues] = useState<PaperclipIssue[]>([]);
   const [comments, setComments] = useState<PaperclipComment[]>([]);
@@ -63,7 +151,40 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const [sending, setSending] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
+  // UX preferences (persisted)
+  const [collapsed, setCollapsed] = useState(() => readBoolPref(LS_COLLAPSED, false));
+  const [fontScale, setFontScale] = useState<number>(() => readScalePref());
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_COLLAPSED, collapsed ? '1' : '0'); } catch {}
+  }, [collapsed]);
+  useEffect(() => {
+    try { localStorage.setItem(LS_FONT_SCALE, String(fontScale)); } catch {}
+  }, [fontScale]);
+
+  // Convenience size function — all measured-text sizes pass through this so
+  // the scale control applies uniformly.
+  const size = useCallback((base: number) => Math.round(base * fontScale), [fontScale]);
+
+  const scaleIndex = FONT_SCALES.indexOf(fontScale as (typeof FONT_SCALES)[number]);
+  const canScaleDown = scaleIndex > 0;
+  const canScaleUp = scaleIndex >= 0 && scaleIndex < FONT_SCALES.length - 1;
+  const onScaleDown = useCallback(() => {
+    const i = FONT_SCALES.indexOf(fontScale as (typeof FONT_SCALES)[number]);
+    if (i > 0) setFontScale(FONT_SCALES[i - 1]);
+  }, [fontScale]);
+  const onScaleUp = useCallback(() => {
+    const i = FONT_SCALES.indexOf(fontScale as (typeof FONT_SCALES)[number]);
+    if (i >= 0 && i < FONT_SCALES.length - 1) setFontScale(FONT_SCALES[i + 1]);
+  }, [fontScale]);
+  const onToggleCollapsed = useCallback(() => setCollapsed((c) => !c), []);
+
   const agentName = selectedAgentName ?? 'סוכן';
+  const agentInitial = useMemo(() => {
+    const trimmed = agentName.trim();
+    return trimmed.length > 0 ? trimmed.charAt(0) : '?';
+  }, [agentName]);
+
   const agentUuid = useMemo(
     () => (selectedAgentId == null ? null : uuidForNumericAgentId(selectedAgentId)),
     [selectedAgentId],
@@ -110,9 +231,6 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
       const entityType = String(payload.entityType ?? '');
       const entityId = String(payload.entityId ?? '');
       const action = String(payload.action ?? '');
-      // We want any comment-related activity on the current issue. The
-      // payload usually carries the issue id either as entityId (when
-      // entity=issue) or under issueId. Match both.
       const issueIdInPayload = String(payload.issueId ?? '');
       const matchesIssue =
         (entityType === 'issue' && entityId === issue.id) || issueIdInPayload === issue.id;
@@ -124,13 +242,10 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     return unsubscribe;
   }, [issue]);
 
-  // Auto-scroll to bottom when new comments arrive
   const scrollRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-    }
+    if (el) el.scrollTop = el.scrollHeight;
   }, [comments]);
 
   const handleSend = useCallback(async () => {
@@ -146,7 +261,6 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
       return;
     }
     setDraft('');
-    // Optimistic: append immediately (the WS event will reconcile via fetch)
     setComments((prev) => [...prev, created]);
   }, [issue, draft]);
 
@@ -160,46 +274,170 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     [handleSend],
   );
 
-  // ── Render ────────────────────────────────────────────────────────────────
-
   const empty = !selectedAgentId || !agentUuid;
 
+  // ── Collapsed strip ────────────────────────────────────────────────────────
+  if (collapsed) {
+    return (
+      <aside
+        dir="rtl"
+        className="gb-chat-panel-scope"
+        style={
+          {
+            position: 'fixed',
+            top: 38,
+            right: 0,
+            bottom: 0,
+            width: 44,
+            background: 'rgba(15, 23, 42, 0.92)',
+            backdropFilter: 'blur(8px)',
+            borderInlineStart: '1px solid rgba(255,255,255,0.08)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            paddingBlockStart: 10,
+            gap: 10,
+            zIndex: 100,
+            boxShadow: '-2px 0 12px rgba(0,0,0,0.35)',
+            // CSS variable read by `.gb-chat-panel-scope` in index.css — the
+            // scope class beats the global `*` rule that would otherwise force
+            // every descendant to FS Pixel Sans.
+            ['--gb-chat-font' as string]: PANEL_FONT_STACK,
+          } as React.CSSProperties
+        }
+      >
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          title="הצג פאנל"
+          aria-label="הצג פאנל"
+          style={{
+            width: 28,
+            height: 28,
+            background: 'linear-gradient(135deg, #4f46e5, #7c3aed)',
+            color: '#fff',
+            border: 'none',
+            borderRadius: 6,
+            cursor: 'pointer',
+            fontSize: 16,
+            fontWeight: 700,
+            lineHeight: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          ‹
+        </button>
+        <div
+          title={empty ? 'אין סוכן נבחר' : agentName}
+          style={{
+            width: 28,
+            height: 28,
+            background: empty ? '#475569' : '#16a34a',
+            color: '#fff',
+            borderRadius: '50%',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 13,
+            fontWeight: 700,
+            border: '1px solid rgba(255,255,255,0.2)',
+          }}
+        >
+          {agentInitial}
+        </div>
+        {comments.length > 0 && !empty ? (
+          <div
+            title={`${comments.length} הודעות`}
+            style={{
+              fontSize: 10,
+              color: '#94a3b8',
+              fontWeight: 600,
+            }}
+          >
+            {comments.length}
+          </div>
+        ) : null}
+      </aside>
+    );
+  }
+
+  // ── Expanded panel ────────────────────────────────────────────────────────
   return (
     <aside
       dir="rtl"
-      style={{
-        position: 'fixed',
-        top: 32, // sit below the bootstrap banner
-        right: 0,
-        bottom: 0,
-        width: 420,
-        background: 'rgba(15, 23, 42, 0.92)',
-        backdropFilter: 'blur(8px)',
-        borderInlineStart: '1px solid rgba(255,255,255,0.08)',
-        display: 'flex',
-        flexDirection: 'column',
-        color: '#e2e8f0',
-        fontFamily: "'Heebo', 'Assistant', 'Rubik', system-ui, sans-serif",
-        fontSize: 15,
-        zIndex: 100,
-        boxShadow: '-2px 0 12px rgba(0,0,0,0.35)',
-      }}
+      className="gb-chat-panel-scope"
+      style={
+        {
+          position: 'fixed',
+          top: 38,
+          right: 0,
+          bottom: 0,
+          width: 420,
+          background: 'rgba(15, 23, 42, 0.92)',
+          backdropFilter: 'blur(8px)',
+          borderInlineStart: '1px solid rgba(255,255,255,0.08)',
+          display: 'flex',
+          flexDirection: 'column',
+          color: '#e2e8f0',
+          fontSize: size(15),
+          zIndex: 100,
+          boxShadow: '-2px 0 12px rgba(0,0,0,0.35)',
+          transition: 'width 0.2s ease-in-out',
+          // CSS variable read by `.gb-chat-panel-scope` in index.css.
+          ['--gb-chat-font' as string]: PANEL_FONT_STACK,
+        } as React.CSSProperties
+      }
     >
       {/* Header */}
       <header
         style={{
-          padding: '16px 18px',
+          padding: '12px 14px',
           background: 'linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%)',
           color: '#fff',
           display: 'flex',
           flexDirection: 'column',
-          gap: 6,
+          gap: 8,
         }}
       >
-        <div style={{ fontWeight: 700, fontSize: 18 }}>
-          {empty ? 'בחר סוכן במשרד' : agentName}
+        {/* Top row: title + minimal controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div
+            style={{
+              fontWeight: 700,
+              fontSize: size(18),
+              flex: 1,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {empty ? 'בחר סוכן במשרד' : agentName}
+          </div>
+          <div style={{ display: 'inline-flex', gap: 4, flexShrink: 0 }}>
+            <IconButton
+              title="הקטן גופנים"
+              onClick={onScaleDown}
+              disabled={!canScaleDown}
+            >
+              A−
+            </IconButton>
+            <IconButton
+              title="הגדל גופנים"
+              onClick={onScaleUp}
+              disabled={!canScaleUp}
+            >
+              A+
+            </IconButton>
+            <IconButton title="קפל פאנל" onClick={onToggleCollapsed}>
+              ›
+            </IconButton>
+          </div>
         </div>
-        <div style={{ fontSize: 13, opacity: 0.9 }}>
+        {/* Sub-row: issue title */}
+        <div style={{ fontSize: size(13), opacity: 0.9 }}>
           {empty
             ? 'לחץ על דמות במשרד כדי לפתוח שיחה'
             : issue
@@ -225,11 +463,26 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
         }}
       >
         {empty ? null : loading ? (
-          <div style={{ textAlign: 'center', color: '#94a3b8', fontSize: 14, marginTop: 28 }}>
+          <div
+            style={{
+              textAlign: 'center',
+              color: '#94a3b8',
+              fontSize: size(14),
+              marginTop: 28,
+            }}
+          >
             טוען היסטוריה…
           </div>
         ) : comments.length === 0 ? (
-          <div style={{ textAlign: 'center', color: '#94a3b8', fontSize: 14, marginTop: 28, lineHeight: 1.6 }}>
+          <div
+            style={{
+              textAlign: 'center',
+              color: '#94a3b8',
+              fontSize: size(14),
+              marginTop: 28,
+              lineHeight: 1.6,
+            }}
+          >
             {issue
               ? 'אין הודעות עדיין בשיחה הזו. שלח את הראשונה.'
               : 'אין issue פעיל. צור issue ב-Paperclip ב-:3100 והקצה אותו לסוכן.'}
@@ -251,18 +504,32 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                   borderRadius: 12,
                   borderTopRightRadius: isHuman ? 12 : 3,
                   borderTopLeftRadius: isHuman ? 3 : 12,
-                  fontSize: 15,
+                  fontSize: size(15),
                   lineHeight: 1.55,
                   boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-word',
                 }}
               >
-                <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 3, fontWeight: 700 }}>
+                <div
+                  style={{
+                    fontSize: size(12),
+                    opacity: 0.75,
+                    marginBottom: 3,
+                    fontWeight: 700,
+                  }}
+                >
                   {author.name}
                 </div>
                 <div>{c.body}</div>
-                <div style={{ fontSize: 11, opacity: 0.6, marginTop: 6, textAlign: 'start' }}>
+                <div
+                  style={{
+                    fontSize: size(11),
+                    opacity: 0.6,
+                    marginTop: 6,
+                    textAlign: 'start',
+                  }}
+                >
                   {formatTime(c.createdAt)}
                 </div>
               </div>
@@ -277,7 +544,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           style={{
             background: '#7f1d1d',
             color: '#fecaca',
-            fontSize: 14,
+            fontSize: size(14),
             padding: '8px 14px',
           }}
         >
@@ -302,11 +569,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={
-            empty
-              ? 'בחר סוכן…'
-              : issue
-                ? 'כתוב הודעה…'
-                : 'אין שיחה פעילה'
+            empty ? 'בחר סוכן…' : issue ? 'כתוב הודעה…' : 'אין שיחה פעילה'
           }
           disabled={empty || !issue || sending}
           style={{
@@ -320,7 +583,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             background: 'rgba(255,255,255,0.06)',
             color: '#f1f5f9',
             fontFamily: 'inherit',
-            fontSize: 15,
+            fontSize: size(15),
             lineHeight: 1.45,
             outline: 'none',
           }}
@@ -335,13 +598,14 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             border: 'none',
             borderRadius: 10,
             padding: '10px 18px',
-            fontSize: 15,
+            fontSize: size(15),
             fontWeight: 700,
             cursor:
               empty || !issue || sending || draft.trim().length === 0
                 ? 'not-allowed'
                 : 'pointer',
-            opacity: empty || !issue || sending || draft.trim().length === 0 ? 0.5 : 1,
+            opacity:
+              empty || !issue || sending || draft.trim().length === 0 ? 0.5 : 1,
             fontFamily: 'inherit',
           }}
         >

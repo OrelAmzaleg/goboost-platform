@@ -126,3 +126,20 @@
     opacity: 0.3;
   }
 }
+
+/* GoBoost chat panel — scope override.
+ * The pixel-agents base CSS applies `font-pixel` (FS Pixel Sans) to every
+ * element via the wildcard `* { @apply font-pixel; }` rule. That rule wins
+ * over the panel root's inline `fontFamily` for all descendants, which made
+ * the font-family toggle look like a no-op. This block re-targets the
+ * descendants to inherit the panel root's font via a class with higher
+ * specificity than `*`. */
+.gb-chat-panel-scope {
+  font-family: var(--gb-chat-font, 'Heebo', system-ui, -apple-system, sans-serif);
+}
+.gb-chat-panel-scope *,
+.gb-chat-panel-scope textarea,
+.gb-chat-panel-scope input,
+.gb-chat-panel-scope button {
+  font-family: inherit;
+}

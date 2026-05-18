@@ -5,6 +5,8 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>GoBoost · ממשק ויזואלי</title>
+    <!-- GoBoost typography (Heebo) ships bundled via @fontsource —
+         imported in src/main.tsx. No CDN dependency. -->
     <style>
       /* GoBoost: top banner so we know our shell is the one running.
          Removed once we build a real top-bar component. */
@@ -13,31 +15,39 @@
         inset-block-start: 0;
         inset-inline-start: 0;
         inset-inline-end: 0;
-        height: 32px;
+        height: 38px;
         background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%);
         color: #fff;
-        font-family: 'Heebo', 'Assistant', 'Rubik', system-ui, -apple-system, sans-serif;
-        font-size: 13px;
+        font-family: 'Heebo', system-ui, -apple-system, sans-serif !important;
+        font-size: 15px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 0 14px;
+        padding: 0 16px;
         z-index: 9999;
         direction: rtl;
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
       }
+      /* Banner sits OUTSIDE the React root, but pixel-agents' `* { @apply
+         font-pixel }` rule still applies once the app stylesheet loads —
+         which is why the banner text appeared shrunken. Force the right
+         family/size on all banner descendants. */
+      #gb-bootstrap-banner,
+      #gb-bootstrap-banner * {
+        font-family: 'Heebo', system-ui, -apple-system, sans-serif !important;
+      }
       #gb-bootstrap-banner .gb-right {
         font-weight: 700;
+        font-size: 15px;
         letter-spacing: 0.02em;
       }
       #gb-bootstrap-banner .gb-left {
         opacity: 0.85;
-        font-size: 11px;
-        font-family: system-ui, monospace;
+        font-size: 13px;
       }
       body {
         margin: 0;
-        padding-block-start: 32px; /* room for banner */
+        padding-block-start: 38px; /* room for banner */
       }
     </style>
   </head>
