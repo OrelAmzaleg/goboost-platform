@@ -3,16 +3,39 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   createIssue,
   fetchAgentIssues,
+  fetchCompanyAgents,
+  fetchIssueApprovals,
+  fetchIssueAttachments,
   fetchIssueComments,
+  fetchIssueThreadInteractions,
+  getAgentName,
   postIssueComment,
   subscribeActivity,
   subscribeHeartbeatEvents,
+  updateIssueAssignee,
   uuidForNumericAgentId,
+  type PaperclipAgentSummary,
+  type PaperclipApproval,
+  type PaperclipAttachment,
   type PaperclipComment,
   type PaperclipHeartbeatEvent,
   type PaperclipIssue,
+  type PaperclipThreadInteraction,
 } from '../paperclipApi.js';
+import { ApprovalCard } from './ApprovalCard.js';
+import { AttachmentChip } from './AttachmentChip.js';
+import { DebriefAccordion, isDebriefComment } from './DebriefAccordion.js';
+import { InteractionCard } from './InteractionCard.js';
+import { aggregateRuns } from './LiveRunCard.js';
+import { MarkdownText } from './MarkdownText.js';
+import { RunsAccordion } from './RunsAccordion.js';
+import { SystemNoticeCard } from './SystemNoticeCard.js';
 import { TasksPanel } from './TasksPanel.js';
+import {
+  TIMELINE_TICK_ACTIONS,
+  TimelineTick,
+  type TimelineTickEvent,
+} from './TimelineTick.js';
 
 /**
  * GoBoost WhatsApp Chat Panel.
@@ -70,25 +93,45 @@ function readScalePref(): number {
 }
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+// Bubble classification for the chat timeline.
+//
+// `system_notice` is its own kind — it short-circuits all other tests and
+// triggers the rich alert card (SystemNoticeCard). The check is BEFORE the
+// agent/user logic so we don't misclassify an agent-authored notice as a
+// regular agent bubble just because the run that emitted it had an agentId.
+//
+// `system_legacy` is the fallback for `authorType === 'system'` comments
+// without a `presentation.kind` field — older Paperclip rows from before
+// the presentation contract existed. Rendered as the small centered pill.
+//
+// `agent` / `human` are the two dialog bubble variants.
 interface BubbleAuthor {
-  type: 'human' | 'agent' | 'system';
+  type: 'human' | 'agent' | 'system_notice' | 'system_legacy';
   name: string;
 }
 
 function authorFor(comment: PaperclipComment, fallbackAgentName: string): BubbleAuthor {
-  // Classification order matters: in Paperclip's local_trusted mode the
-  // local-board user is recorded as the actor even for content the agent
-  // produced during a heartbeat run. The most reliable signal that this
-  // is *agent content* is `createdByRunId` — runs only exist as part of
-  // an agent's execution loop. authorAgentId is also a positive signal.
-  // We check those FIRST, then fall back to plain authorUserId/authorType.
+  // 1. Explicit system notice — the strongest signal. Render rich card.
+  if (
+    comment.authorType === 'system' &&
+    comment.presentation?.kind === 'system_notice'
+  ) {
+    return { type: 'system_notice', name: 'מערכת' };
+  }
+  // 2. Agent-authored: in Paperclip's local_trusted mode the local-board
+  //    user is recorded as the actor even for content the agent produced
+  //    during a heartbeat run. The most reliable signal that this is
+  //    *agent content* is `createdByRunId` — runs only exist as part of
+  //    an agent's execution loop. authorAgentId is also a positive signal.
   if (comment.authorAgentId || comment.createdByRunId) {
     return { type: 'agent', name: fallbackAgentName };
   }
+  // 3. Human-authored.
   if (comment.authorUserId || comment.authorType === 'user') {
     return { type: 'human', name: 'אני' };
   }
-  return { type: 'system', name: 'מערכת' };
+  // 4. Legacy system row (no presentation contract). Compact pill.
+  return { type: 'system_legacy', name: 'מערכת' };
 }
 
 function formatTime(iso: string): string {
@@ -204,10 +247,88 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const [issue, setIssue] = useState<PaperclipIssue | null>(null);
   const [allIssues, setAllIssues] = useState<PaperclipIssue[]>([]);
   const [comments, setComments] = useState<PaperclipComment[]>([]);
+  // 2.B.4 / 2.B.7 — interactions + attachments per issue.
+  const [interactions, setInteractions] = useState<PaperclipThreadInteraction[]>([]);
+  const [attachments, setAttachments] = useState<PaperclipAttachment[]>([]);
+  // 2.B.4 follow-up — approvals are surfaced inline in the chat flow
+  // (not just in the Tasks Panel) so the operator can act on them
+  // without leaving the conversation.
+  const [approvals, setApprovals] = useState<PaperclipApproval[]>([]);
+  // 2.B.5 — timeline ticks. Activity rows that match TIMELINE_TICK_ACTIONS
+  // for the active issue, captured live from subscribeActivity. Bootstrap-
+  // wise we start empty (no historical activity endpoint) and grow as
+  // events arrive — acceptable since these are low-noise drift events
+  // that the user catches in real time anyway.
+  const [ticks, setTicks] = useState<TimelineTickEvent[]>([]);
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
+
+  // Assignee picker (per design discussion 2026-05): chip next to the
+  // composer that shows the active Issue's current assignee. Default
+  // matches whichever agent is currently assigned on the Issue. Picking
+  // a different agent calls PATCH /issues/:id with `{assigneeAgentId}` —
+  // Paperclip then logs `issue.assignee_changed` and wakes up the new
+  // assignee. The previous assignee stops getting wake-ups on this Issue.
+  const [companyAgents, setCompanyAgents] = useState<PaperclipAgentSummary[]>([]);
+  const [assigneePickerOpen, setAssigneePickerOpen] = useState(false);
+  const [reassigning, setReassigning] = useState(false);
+  const assigneePickerWrapRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!assigneePickerOpen) return;
+    const handler = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (
+        assigneePickerWrapRef.current &&
+        target &&
+        !assigneePickerWrapRef.current.contains(target)
+      ) {
+        setAssigneePickerOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [assigneePickerOpen]);
+  // Load the full agent roster for the picker. We re-attempt whenever the
+  // active issue changes because `fetchCompanyAgents` depends on
+  // `moduleCompanyId` being populated by startPaperclipApi — which races
+  // against this component mounting on a cold start. By the time an issue
+  // is in focus, the WS handshake has long completed and the company id
+  // is definitely set. The condition `companyAgents.length === 0` keeps
+  // us from refetching on every issue switch when we already have data.
+  useEffect(() => {
+    if (companyAgents.length > 0 || !issue) return;
+    let cancelled = false;
+    void fetchCompanyAgents().then((agents) => {
+      if (!cancelled) setCompanyAgents(agents);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [issue, companyAgents.length]);
+  const onChangeAssignee = useCallback(
+    async (next: PaperclipAgentSummary) => {
+      if (!issue || reassigning) return;
+      if (next.id === issue.assigneeAgentId) {
+        setAssigneePickerOpen(false);
+        return;
+      }
+      setReassigning(true);
+      const updated = await updateIssueAssignee(issue.id, next.id);
+      setReassigning(false);
+      setAssigneePickerOpen(false);
+      if (updated) {
+        setIssue(updated);
+        setAllIssues((prev) =>
+          prev.map((it) => (it.id === updated.id ? updated : it)),
+        );
+      } else {
+        setErrorText('שינוי הסוכן נכשל. נסה שוב.');
+      }
+    },
+    [issue, reassigning],
+  );
 
   // UX preferences (persisted)
   const [collapsed, setCollapsed] = useState(() => readBoolPref(LS_COLLAPSED, false));
@@ -293,6 +414,11 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const onToggleCollapsed = useCallback(() => setCollapsed((c) => !c), []);
 
   const agentName = selectedAgentName ?? 'סוכן';
+  // Name shown on the assignee chip — falls back to the agent the user
+  // clicked into the chat with, since on a fresh Issue the assignee
+  // typically matches that anyway.
+  const currentAssigneeName =
+    (issue?.assigneeAgentId && getAgentName(issue.assigneeAgentId)) ?? agentName;
   const agentInitial = useMemo(() => {
     const trimmed = agentName.trim();
     return trimmed.length > 0 ? trimmed.charAt(0) : '?';
@@ -303,37 +429,71 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     [selectedAgentId],
   );
 
-  // "+ שיחה חדשה" — declared HERE because it depends on agentUuid/agentName
-  // computed just above. Transparent flow: no modal, no fields. Click →
-  // create a fresh issue assigned to the active agent → switch the chat
-  // thread to it. Auto-titled with timestamp; renameable later in
-  // Paperclip's classic UI if the operator cares.
-  const onNewConversation = useCallback(async () => {
+  // "+ שיחה חדשה" — declared HERE because it depends on agentUuid/agentName.
+  //
+  // UX (per design discussion 2026-05): clicking the button does NOT create
+  // an Issue immediately. It opens a small inline form with two fields:
+  // title (required) and description (optional). On submit we create the
+  // Issue assigned to the active agent and switch the thread.
+  //
+  // Why this matters: an Issue in Paperclip = a unit of work. Auto-titling
+  // every conversation as "שיחה · {agent} · {timestamp}" produces a flat
+  // graph of meaningless "task" rows — operator can't find anything later.
+  // Making the user name the conversation up-front forces a one-line
+  // summary that doubles as the task's purpose.
+  const [newFormOpen, setNewFormOpen] = useState(false);
+  const [newTitle, setNewTitle] = useState('');
+  const [newDescription, setNewDescription] = useState('');
+  // Status + priority match Paperclip's "New issue" composer. We expose
+  // the common set; uncommon values (e.g. custom status enums) require
+  // editing in Paperclip's classic UI.
+  const [newStatus, setNewStatus] = useState<string>('todo');
+  const [newPriority, setNewPriority] = useState<string>('medium');
+  const closeNewForm = useCallback(() => {
+    setNewFormOpen(false);
+    setNewTitle('');
+    setNewDescription('');
+    setNewStatus('todo');
+    setNewPriority('medium');
+  }, []);
+  const onOpenNewForm = useCallback(() => {
+    setNewFormOpen(true);
+    setNewTitle('');
+    setNewDescription('');
+    setNewStatus('todo');
+    setNewPriority('medium');
+  }, []);
+  const onSubmitNewConversation = useCallback(async () => {
     if (!agentUuid || creatingConversation) return;
+    const trimmedTitle = newTitle.trim();
+    if (!trimmedTitle) return;
     setCreatingConversation(true);
     try {
-      const stamp = new Date().toLocaleString('he-IL', {
-        day: '2-digit',
-        month: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-      const title = `שיחה · ${agentName} · ${stamp}`;
       const newIssue = await createIssue({
-        title,
-        description: '',
+        title: trimmedTitle,
+        description: newDescription.trim(),
         assigneeAgentId: agentUuid,
-        status: 'todo',
+        status: newStatus,
+        priority: newPriority,
       });
       if (newIssue) {
         setAllIssues((prev) => [newIssue, ...prev]);
         setIssue(newIssue);
         setPickerOpen(false);
+        closeNewForm();
       }
     } finally {
       setCreatingConversation(false);
     }
-  }, [agentUuid, agentName, creatingConversation]);
+  }, [
+    agentUuid,
+    newTitle,
+    newDescription,
+    newStatus,
+    newPriority,
+    creatingConversation,
+    closeNewForm,
+  ]);
 
   // Subscribe to heartbeat events whenever there's an agent in focus.
   // Declared here (not next to setHeartbeatEvents above) because it
@@ -342,20 +502,29 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   // shows the most recent one anyway.
   useEffect(() => {
     if (!agentUuid) return;
+    // Accept heartbeat events for either:
+    //   • the agent the user clicked into the chat with, OR
+    //   • the active issue's current assignee.
+    // The two diverge when the user reassigns mid-conversation: the
+    // chat is still anchored on the clicked agent, but new runs flow
+    // from the new assignee. Including both keeps the RunsAccordion
+    // populated across handoffs.
+    const issueAssigneeId = issue?.assigneeAgentId ?? null;
     const unsubscribe = subscribeHeartbeatEvents((event) => {
-      if (event.agentId !== agentUuid) return;
+      if (event.agentId !== agentUuid && event.agentId !== issueAssigneeId) return;
       setHeartbeatEvents((prev) => {
         const next = [...prev, event];
         return next.length > 30 ? next.slice(next.length - 30) : next;
       });
     });
     return unsubscribe;
-  }, [agentUuid]);
+  }, [agentUuid, issue?.assigneeAgentId]);
 
-  // Most-recent event for the transient "thinking…" indicator.
-  const latestHeartbeatEvent = heartbeatEvents.length > 0
-    ? heartbeatEvents[heartbeatEvents.length - 1]
-    : null;
+  // Heartbeat events are projected into `liveRuns` via `aggregateRuns`
+  // and rendered inside the collapsible RunsAccordion below the chat.
+  // The old transient "thinking strip" below the bubbles has been
+  // removed — the per-run transient line inside each LiveRunCard now
+  // covers that affordance.
 
   // Merged timeline used by the bubble renderer below.
   //
@@ -373,26 +542,133 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   //      bubble area (4).
   type TimelineItem =
     | { kind: 'origin'; key: string; createdAt: string }
-    | { kind: 'comment'; key: string; createdAt: string; comment: PaperclipComment };
+    | {
+        kind: 'comment';
+        key: string;
+        createdAt: string;
+        comment: PaperclipComment;
+        /** Inline attachments owned by this comment, oldest first. */
+        commentAttachments: PaperclipAttachment[];
+      }
+    | {
+        kind: 'interaction';
+        key: string;
+        createdAt: string;
+        interaction: PaperclipThreadInteraction;
+      }
+    | {
+        kind: 'approval';
+        key: string;
+        createdAt: string;
+        approval: PaperclipApproval;
+      }
+    | {
+        kind: 'tick';
+        key: string;
+        createdAt: string;
+        event: TimelineTickEvent;
+      }
+    | {
+        kind: 'attachment';
+        key: string;
+        createdAt: string;
+        attachment: PaperclipAttachment;
+      };
+
+  // Aggregate live heartbeat events into LiveRun objects, scoped to the
+  // active agent (the subscription is already filtered at write-time).
+  const liveRuns = useMemo(() => aggregateRuns(heartbeatEvents), [heartbeatEvents]);
+
+  // Comments that look like heartbeat self-debriefs (self-echo guards,
+  // disposition notes, "exiting cleanly" reports). They're routed to the
+  // DebriefAccordion below the chat so they don't drown the dialogue.
+  const debriefComments = useMemo(
+    () => comments.filter(isDebriefComment),
+    [comments],
+  );
+
   const timeline = useMemo<TimelineItem[]>(() => {
+    // While the operator switches between agents/issues, `setIssue(null)`
+    // fires *before* the effect that clears comments/interactions/etc.
+    // can run. Any descendant that dereferences `issue!.id` during that
+    // tick will throw (`Cannot read properties of null (reading 'id')`)
+    // and React will tear down the whole panel — which then cleans up
+    // App.tsx's WS effect and disconnects Paperclip. Guarding here is
+    // the cheapest place to short-circuit the race.
+    if (!issue) return [];
     const items: TimelineItem[] = [];
-    if (issue && (issue.description?.trim() || issue.title)) {
+    if (issue.description?.trim() || issue.title) {
       items.push({
         kind: 'origin',
         key: `o:${issue.id}`,
         createdAt: issue.createdAt,
       });
     }
+    // Index attachments owned by a comment, so each comment item can carry
+    // its inline tail. Standalone attachments (issueCommentId === null) are
+    // pushed into the timeline as their own item.
+    const byComment = new Map<string, PaperclipAttachment[]>();
+    const standaloneAttachments: PaperclipAttachment[] = [];
+    for (const a of attachments) {
+      if (a.issueCommentId) {
+        const list = byComment.get(a.issueCommentId) ?? [];
+        list.push(a);
+        byComment.set(a.issueCommentId, list);
+      } else {
+        standaloneAttachments.push(a);
+      }
+    }
     for (const c of comments) {
+      // Heartbeat self-reflection comments (self-echo, disposition,
+      // "exiting cleanly" etc.) get routed to the DebriefAccordion
+      // instead of cluttering the dialogue stream.
+      if (isDebriefComment(c)) continue;
       items.push({
         kind: 'comment',
         key: `c:${c.id}`,
         createdAt: c.createdAt,
         comment: c,
+        commentAttachments: byComment.get(c.id) ?? [],
+      });
+    }
+    for (const ix of interactions) {
+      items.push({
+        kind: 'interaction',
+        key: `i:${ix.id}`,
+        createdAt: ix.createdAt,
+        interaction: ix,
+      });
+    }
+    for (const ap of approvals) {
+      items.push({
+        kind: 'approval',
+        key: `ap:${ap.id}`,
+        createdAt: ap.createdAt,
+        approval: ap,
+      });
+    }
+    for (const t of ticks) {
+      items.push({
+        kind: 'tick',
+        key: `t:${t.id}`,
+        createdAt: t.createdAt,
+        event: t,
+      });
+    }
+    // Runs are NOT merged into the timeline anymore — they live in a
+    // separate collapsible container at the bottom of the chat (rendered
+    // below `timeline.map`). This keeps the message flow uncluttered when
+    // the agent is doing a lot of background work.
+    for (const a of standaloneAttachments) {
+      items.push({
+        kind: 'attachment',
+        key: `a:${a.id}`,
+        createdAt: a.createdAt,
+        attachment: a,
       });
     }
     return items.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
-  }, [comments, issue]);
+  }, [comments, interactions, approvals, ticks, attachments, liveRuns, issue]);
 
   // Reset state when a different agent is selected
   useEffect(() => {
@@ -426,19 +702,34 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   }, [agentUuid]);
 
   // Effect B: whenever the active issue changes (auto-selected or
-  // operator-picked from the session navigator), fetch its comments.
+  // operator-picked from the session navigator), fetch its comments,
+  // interactions, and attachments. Ticks have no historical endpoint —
+  // they accumulate live via the activity subscription below.
   useEffect(() => {
     if (!issue) {
       setComments([]);
+      setInteractions([]);
+      setAttachments([]);
+      setApprovals([]);
+      setTicks([]);
       setLoading(false);
       return;
     }
     let cancelled = false;
     setLoading(true);
+    setTicks([]); // reset live ticks on issue switch
     (async () => {
-      const c = await fetchIssueComments(issue.id);
+      const [c, ix, att, ap] = await Promise.all([
+        fetchIssueComments(issue.id),
+        fetchIssueThreadInteractions(issue.id),
+        fetchIssueAttachments(issue.id),
+        fetchIssueApprovals(issue.id),
+      ]);
       if (cancelled) return;
       setComments(c);
+      setInteractions(ix);
+      setAttachments(att);
+      setApprovals(ap);
       setLoading(false);
     })();
     return () => {
@@ -446,7 +737,8 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     };
   }, [issue]);
 
-  // Refresh comments when activity fires for our current issue
+  // Refresh streams on relevant activity events for our current issue.
+  // The action vocabulary determines which stream we refetch.
   useEffect(() => {
     if (!issue) return;
     const unsubscribe = subscribeActivity((payload) => {
@@ -455,10 +747,79 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
       const action = String(payload.action ?? '');
       const issueIdInPayload = String(payload.issueId ?? '');
       const matchesIssue =
-        (entityType === 'issue' && entityId === issue.id) || issueIdInPayload === issue.id;
-      const isCommentAction = /comment|reply|message/i.test(action);
-      if (matchesIssue && isCommentAction) {
+        (entityType === 'issue' && entityId === issue.id) ||
+        issueIdInPayload === issue.id;
+
+      // Approvals are a special case: when the user approves/rejects in
+      // Paperclip's dashboard, the activity fires with
+      //   { entityType: "approval", entityId: <approvalId>,
+      //     details: { linkedIssueIds: [...] } }
+      // i.e. NOT scoped to any single issue — `matchesIssue` would be
+      // false. Refetch on any `approval.*` action whose linkedIssueIds
+      // contains our active issue id. We cheat slightly and just
+      // refetch on every approval action, since the round-trip is
+      // cheap and false-positives are silently dropped by setState.
+      const isApprovalAction = action.startsWith('approval.');
+      if (isApprovalAction) {
+        const details = (payload.details ?? {}) as { linkedIssueIds?: unknown };
+        const linkedIds = Array.isArray(details.linkedIssueIds)
+          ? (details.linkedIssueIds as unknown[])
+          : [];
+        const linkedHere = linkedIds.includes(issue.id);
+        if (linkedHere || linkedIds.length === 0) {
+          void fetchIssueApprovals(issue.id).then(setApprovals);
+        }
+      }
+
+      if (!matchesIssue) return;
+
+      // Comments (existing behavior — kept liberal).
+      if (/comment|reply|message/i.test(action)) {
         void fetchIssueComments(issue.id).then(setComments);
+      }
+      // Interactions — refetch on any thread_interaction_* action.
+      if (/thread_interaction/i.test(action)) {
+        void fetchIssueThreadInteractions(issue.id).then(setInteractions);
+      }
+      // Attachments.
+      if (/attachment/i.test(action)) {
+        void fetchIssueAttachments(issue.id).then(setAttachments);
+      }
+      // Approval link/unlink — these DO fire against the issue. The
+      // generic approval.* block above already handled approval.created
+      // /approved/rejected (which fire against the approval entity).
+      if (/approval_linked|approval_unlinked/i.test(action)) {
+        void fetchIssueApprovals(issue.id).then(setApprovals);
+      }
+      // Timeline ticks — capture inline (no historical fetch).
+      if (TIMELINE_TICK_ACTIONS.has(action)) {
+        const createdAt =
+          (typeof payload.createdAt === 'string' ? payload.createdAt : null) ??
+          new Date().toISOString();
+        const activityId =
+          typeof payload.id === 'string' || typeof payload.id === 'number'
+            ? String(payload.id)
+            : `${action}:${createdAt}`;
+        setTicks((prev) => {
+          if (prev.some((t) => t.id === activityId)) return prev;
+          return [
+            ...prev,
+            {
+              id: activityId,
+              action,
+              createdAt,
+              payload: (payload.metadata as Record<string, unknown>) ?? payload,
+              actorAgentId:
+                typeof payload.actorAgentId === 'string'
+                  ? (payload.actorAgentId as string)
+                  : null,
+              actorUserId:
+                typeof payload.actorUserId === 'string'
+                  ? (payload.actorUserId as string)
+                  : null,
+            },
+          ];
+        });
       }
     });
     return unsubscribe;
@@ -783,13 +1144,14 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
               </span>
             </button>
               ) : null}
-              {/* + שיחה חדשה — transparent create-new-issue button, shown
-                  only when an agent is in focus. Click → POST a fresh
-                  issue assigned to this agent → switch the thread to it. */}
+              {/* + שיחה חדשה — opens an inline title+description form.
+                  Submit creates the Issue assigned to the active agent and
+                  switches the thread. The form itself is rendered below
+                  the header so it doesn't disrupt the chip's layout. */}
               <button
                 type="button"
-                onClick={() => void onNewConversation()}
-                disabled={creatingConversation}
+                onClick={onOpenNewForm}
+                disabled={creatingConversation || newFormOpen}
                 title="פתח שיחה חדשה עם הסוכן"
                 aria-label="פתח שיחה חדשה עם הסוכן"
                 style={{
@@ -935,6 +1297,204 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
         </div>
       </header>
 
+      {/* New-conversation inline form (collapsible). Shown above the
+          message list when the user clicks "שיחה חדשה" in the header.
+          Two fields: title (required) + description (optional). Submit
+          creates the Issue and switches the active thread to it. */}
+      {newFormOpen && !empty ? (
+        <div
+          style={{
+            padding: '12px 14px',
+            background: 'rgba(15, 23, 42, 0.85)',
+            borderBlockEnd: '1px solid rgba(255,255,255,0.06)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 8,
+          }}
+        >
+          <div
+            style={{
+              fontSize: size(11),
+              fontWeight: 700,
+              letterSpacing: 0.3,
+              opacity: 0.8,
+              color: '#dcfce7',
+            }}
+          >
+            שיחה חדשה — תן כותרת קצרה ותיאור (אופציונלי)
+          </div>
+          <input
+            type="text"
+            value={newTitle}
+            onChange={(e) => setNewTitle(e.target.value)}
+            placeholder="כותרת — נושא השיחה או המשימה"
+            disabled={creatingConversation}
+            style={{
+              padding: '8px 10px',
+              borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.12)',
+              background: 'rgba(255,255,255,0.06)',
+              color: '#f1f5f9',
+              fontFamily: 'inherit',
+              fontSize: size(14),
+              outline: 'none',
+            }}
+            autoFocus
+          />
+          <textarea
+            value={newDescription}
+            onChange={(e) => setNewDescription(e.target.value)}
+            placeholder="תיאור — הקשר, רקע, מה מצופה מהסוכן (אופציונלי)"
+            disabled={creatingConversation}
+            rows={3}
+            style={{
+              padding: '8px 10px',
+              borderRadius: 8,
+              border: '1px solid rgba(255,255,255,0.12)',
+              background: 'rgba(255,255,255,0.06)',
+              color: '#f1f5f9',
+              fontFamily: 'inherit',
+              fontSize: size(13),
+              outline: 'none',
+              resize: 'vertical',
+              minHeight: 60,
+              maxHeight: 200,
+            }}
+          />
+          {/* Compact selectors row — status + priority. Paperclip's
+              "New issue" composer has additional fields (project, parent,
+              attachments) which we omit for v1; the common case is a
+              fresh top-level conversation. */}
+          <div
+            style={{
+              display: 'flex',
+              gap: 8,
+              alignItems: 'center',
+              flexWrap: 'wrap',
+            }}
+          >
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                fontSize: size(11),
+                color: '#cbd5e1',
+              }}
+            >
+              <span style={{ opacity: 0.8 }}>סטטוס:</span>
+              <select
+                value={newStatus}
+                onChange={(e) => setNewStatus(e.target.value)}
+                disabled={creatingConversation}
+                style={{
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  background: '#1e293b',
+                  color: '#f1f5f9',
+                  fontFamily: 'inherit',
+                  fontSize: size(11),
+                  outline: 'none',
+                  colorScheme: 'dark',
+                }}
+              >
+                <option value="backlog" style={{ background: '#1e293b', color: '#f1f5f9' }}>תור</option>
+                <option value="todo" style={{ background: '#1e293b', color: '#f1f5f9' }}>לעשות</option>
+                <option value="in_progress" style={{ background: '#1e293b', color: '#f1f5f9' }}>בעבודה</option>
+                <option value="in_review" style={{ background: '#1e293b', color: '#f1f5f9' }}>בבדיקה</option>
+                <option value="done" style={{ background: '#1e293b', color: '#f1f5f9' }}>הושלם</option>
+              </select>
+            </label>
+            <label
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                fontSize: size(11),
+                color: '#cbd5e1',
+              }}
+            >
+              <span style={{ opacity: 0.8 }}>עדיפות:</span>
+              <select
+                value={newPriority}
+                onChange={(e) => setNewPriority(e.target.value)}
+                disabled={creatingConversation}
+                style={{
+                  padding: '4px 8px',
+                  borderRadius: 6,
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  background: '#1e293b',
+                  color: '#f1f5f9',
+                  fontFamily: 'inherit',
+                  fontSize: size(11),
+                  outline: 'none',
+                  colorScheme: 'dark',
+                }}
+              >
+                <option value="low" style={{ background: '#1e293b', color: '#f1f5f9' }}>נמוכה</option>
+                <option value="medium" style={{ background: '#1e293b', color: '#f1f5f9' }}>בינונית</option>
+                <option value="high" style={{ background: '#1e293b', color: '#f1f5f9' }}>גבוהה</option>
+                <option value="urgent" style={{ background: '#1e293b', color: '#f1f5f9' }}>דחופה</option>
+              </select>
+            </label>
+            <span
+              style={{
+                fontSize: size(10),
+                opacity: 0.55,
+                marginInlineStart: 'auto',
+              }}
+            >
+              מוקצה לסוכן: {agentName}
+            </span>
+          </div>
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <button
+              type="button"
+              onClick={closeNewForm}
+              disabled={creatingConversation}
+              style={{
+                padding: '6px 12px',
+                borderRadius: 8,
+                border: '1px solid rgba(255,255,255,0.12)',
+                background: 'transparent',
+                color: '#cbd5e1',
+                fontSize: size(12),
+                fontWeight: 600,
+                fontFamily: 'inherit',
+                cursor: creatingConversation ? 'not-allowed' : 'pointer',
+                opacity: creatingConversation ? 0.6 : 1,
+              }}
+            >
+              ביטול
+            </button>
+            <button
+              type="button"
+              onClick={() => void onSubmitNewConversation()}
+              disabled={creatingConversation || newTitle.trim().length === 0}
+              style={{
+                padding: '6px 14px',
+                borderRadius: 8,
+                border: '1px solid rgba(34,197,94,0.6)',
+                background: 'rgba(34,197,94,0.28)',
+                color: '#dcfce7',
+                fontSize: size(12),
+                fontWeight: 700,
+                fontFamily: 'inherit',
+                cursor:
+                  creatingConversation || newTitle.trim().length === 0
+                    ? 'not-allowed'
+                    : 'pointer',
+                opacity:
+                  creatingConversation || newTitle.trim().length === 0 ? 0.5 : 1,
+              }}
+            >
+              {creatingConversation ? 'יוצר…' : 'פתח שיחה'}
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {/* Bubbles */}
       <div
         ref={scrollRef}
@@ -1022,7 +1582,9 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                     <span>פתיחת השיחה</span>
                   </div>
                   <div style={{ fontWeight: 700, marginBottom: 4 }}>{issue.title}</div>
-                  {issue.description?.trim() ? <div>{issue.description}</div> : null}
+                  {issue.description?.trim() ? (
+                    <MarkdownText text={issue.description} />
+                  ) : null}
                   <div
                     style={{
                       fontSize: size(11),
@@ -1036,20 +1598,98 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                 </div>
               );
             }
+            // ── Interaction card (Stream 2 / Primitive #4). ──
+            if (item.kind === 'interaction') {
+              return (
+                <InteractionCard
+                  key={item.key}
+                  interaction={item.interaction}
+                  issueId={issue!.id}
+                  size={size}
+                  formatTime={formatTime}
+                  onResolved={(next) =>
+                    setInteractions((prev) =>
+                      prev.map((p) => (p.id === next.id ? next : p)),
+                    )
+                  }
+                />
+              );
+            }
+
+            // ── Approval card (acts inline; Approve/Reject buttons). ──
+            if (item.kind === 'approval') {
+              return (
+                <ApprovalCard
+                  key={item.key}
+                  approval={item.approval}
+                  size={size}
+                  formatTime={formatTime}
+                  onResolved={(next) =>
+                    setApprovals((prev) =>
+                      prev.map((p) => (p.id === next.id ? next : p)),
+                    )
+                  }
+                />
+              );
+            }
+
+            // ── Timeline tick (Stream 3 / Primitive #5). ──
+            if (item.kind === 'tick') {
+              return (
+                <TimelineTick
+                  key={item.key}
+                  event={item.event}
+                  size={size}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
+            // (Live run cards have moved to the collapsible Runs container
+            //  rendered below `timeline.map` — they no longer interleave
+            //  with comments.)
+
+            // ── Standalone attachment (Stream 5 / Primitive #9). ──
+            if (item.kind === 'attachment') {
+              return (
+                <AttachmentChip
+                  key={item.key}
+                  attachment={item.attachment}
+                  mode="standalone"
+                  size={size}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
             if (item.kind !== 'comment') return null;
 
             const c = item.comment;
             const author = authorFor(c, agentName);
+            const inlineAttachments = item.commentAttachments;
             const isHuman = author.type === 'human';
-            const isSystem = author.type === 'system';
 
-            // ── System comments — small centered badge with hover tooltip. ──
-            // Per user spec (2.B.2.E): Paperclip "system" messages
-            // (questionnaires, dispositions, control-plane notices) are
-            // operationally important but visually shouldn't compete with
-            // dialog bubbles. Render as a compact pill with an ⓘ icon —
-            // hover reveals the full body.
-            if (isSystem) {
+            // ── System notice — rich alert card (Primitive #3, Stream 1).
+            // Comments with `presentation.kind === "system_notice"` are
+            // structured notices the agent (or system) wanted to surface
+            // as one coherent block: tone color + title + body + metadata
+            // rows. Rendered by SystemNoticeCard. ──
+            if (author.type === 'system_notice') {
+              return (
+                <SystemNoticeCard
+                  key={item.key}
+                  comment={c}
+                  size={size}
+                  formatTime={formatTime}
+                />
+              );
+            }
+
+            // ── Legacy system row — small centered pill with hover tooltip.
+            // Backwards-compatibility for older Paperclip rows that don't
+            // carry the presentation contract. Once the backfill lands all
+            // system rows will route through SystemNoticeCard above. ──
+            if (author.type === 'system_legacy') {
               return (
                 <div
                   key={item.key}
@@ -1139,7 +1779,26 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                 >
                   {author.name}
                 </div>
-                <div>{c.body}</div>
+                <MarkdownText text={c.body} />
+                {inlineAttachments.length > 0 ? (
+                  <div
+                    style={{
+                      marginTop: 6,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 4,
+                    }}
+                  >
+                    {inlineAttachments.map((a) => (
+                      <AttachmentChip
+                        key={a.id}
+                        attachment={a}
+                        mode="inline"
+                        size={size}
+                      />
+                    ))}
+                  </div>
+                ) : null}
                 <div
                   style={{
                     fontSize: size(11),
@@ -1154,66 +1813,35 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             );
           })
         )}
-      </div>
 
-      {/* Thinking strip (2.B.2.E rework) — transient indicator that
-          shows the latest heartbeat event from the active agent. This
-          replaces the old persistent "All Activity" tab. Each new event
-          swaps the visible text in place, mimicking Claude Code's
-          "Thinking…" indicator. Vanishes when there are no events for
-          the active agent (e.g. context switch, or once activity calms). */}
-      {latestHeartbeatEvent && !empty ? (
-        <div
-          title={
-            latestHeartbeatEvent.message ??
-            (latestHeartbeatEvent.payload
-              ? JSON.stringify(latestHeartbeatEvent.payload)
-              : '')
-          }
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            padding: '6px 14px',
-            background: 'rgba(15,23,42,0.6)',
-            borderBlockStart: '1px solid rgba(255,255,255,0.06)',
-            color: '#cbd5e1',
-            fontSize: size(12),
-            fontStyle: 'italic',
-            lineHeight: 1.4,
-          }}
-        >
-          <span
-            aria-hidden
-            style={{
-              fontSize: size(13),
-              animation: 'pixel-pulse 1.5s ease-in-out infinite',
-            }}
-          >
-            💭
-          </span>
-          <span
-            style={{
-              flex: 1,
-              minWidth: 0,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              fontStyle: 'normal',
-              opacity: 0.85,
-            }}
-          >
-            <span style={{ fontWeight: 700, marginInlineEnd: 4 }}>
-              {latestHeartbeatEvent.eventType}
-              {latestHeartbeatEvent.level ? ` · ${latestHeartbeatEvent.level}` : ''}
-            </span>
-            {latestHeartbeatEvent.message ?? ''}
-          </span>
-          <span style={{ fontSize: size(10), opacity: 0.55, flexShrink: 0 }}>
-            {formatTime(latestHeartbeatEvent.createdAt)}
-          </span>
-        </div>
-      ) : null}
+        {/* Debrief accordion — collapsible container holding the agent's
+            heartbeat self-reflection comments (self-echo, disposition,
+            "exiting cleanly", etc). These get filtered out of the main
+            timeline above and re-rendered here so the dialogue stays
+            clean while the audit trail remains available. */}
+        {!empty && debriefComments.length > 0 ? (
+          <DebriefAccordion
+            comments={debriefComments}
+            size={size}
+            formatTime={formatTime}
+            agentName={agentName}
+          />
+        ) : null}
+
+        {/* Runs accordion — a single collapsible container holding all
+            LiveRunCards for the active issue, anchored below the last
+            bubble. Collapsed by default; the header shows a summary
+            (count + latest event line). Replaces both the timeline-merged
+            run cards and the global "thinking strip" that used to live
+            below the message list. */}
+        {!empty && liveRuns.length > 0 ? (
+          <RunsAccordion
+            runs={liveRuns}
+            size={size}
+            formatTime={formatTime}
+          />
+        ) : null}
+      </div>
 
       {/* Error strip */}
       {errorText ? (
@@ -1235,10 +1863,152 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           padding: 12,
           borderBlockStart: '1px solid rgba(255,255,255,0.08)',
           display: 'flex',
-          gap: 10,
-          alignItems: 'flex-end',
+          flexDirection: 'column',
+          gap: 8,
         }}
       >
+        {/* Assignee row — chip showing the active Issue's current assignee.
+            Click → dropdown of all company agents. Selecting a different
+            agent PATCH-es the Issue (Paperclip then fires assignee_changed
+            activity + wakes the new assignee). Default matches the Issue's
+            current assigneeAgentId, falling back to the chat-selected
+            agent's name. */}
+        {issue ? (
+          <div
+            ref={assigneePickerWrapRef}
+            style={{
+              position: 'relative',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: size(11),
+            }}
+          >
+            <span style={{ opacity: 0.7 }}>הקצאה:</span>
+            <button
+              type="button"
+              onClick={() => setAssigneePickerOpen((v) => !v)}
+              disabled={reassigning || companyAgents.length === 0}
+              title="שנה את הסוכן שמטפל ב-Issue הזה"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 5,
+                padding: '3px 9px',
+                background: 'rgba(99,102,241,0.22)',
+                border: '1px solid rgba(129,140,248,0.45)',
+                borderRadius: 999,
+                color: '#e0e7ff',
+                fontSize: size(11),
+                fontWeight: 700,
+                fontFamily: 'inherit',
+                cursor:
+                  reassigning || companyAgents.length === 0
+                    ? 'not-allowed'
+                    : 'pointer',
+                opacity:
+                  reassigning || companyAgents.length === 0 ? 0.6 : 1,
+                lineHeight: 1.3,
+              }}
+            >
+              <span aria-hidden>👤</span>
+              <span
+                style={{
+                  maxWidth: 160,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {reassigning ? '…' : currentAssigneeName}
+              </span>
+              <span style={{ opacity: 0.7 }}>
+                {assigneePickerOpen ? '▲' : '▼'}
+              </span>
+            </button>
+            {assigneePickerOpen && companyAgents.length > 0 ? (
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: 'calc(100% + 6px)',
+                  insetInlineStart: 0,
+                  maxHeight: 240,
+                  overflowY: 'auto',
+                  background: '#1e293b',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 10,
+                  boxShadow: '0 6px 18px rgba(0,0,0,0.45)',
+                  zIndex: 200,
+                  padding: 6,
+                  minWidth: 220,
+                  color: '#e2e8f0',
+                }}
+              >
+                {companyAgents.map((a) => {
+                  const active = a.id === issue.assigneeAgentId;
+                  return (
+                    <button
+                      key={a.id}
+                      type="button"
+                      onClick={() => void onChangeAssignee(a)}
+                      title={a.title ?? a.name}
+                      style={{
+                        width: '100%',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '6px 10px',
+                        background: active
+                          ? 'rgba(99,102,241,0.25)'
+                          : 'transparent',
+                        border: active
+                          ? '1px solid rgba(129,140,248,0.6)'
+                          : '1px solid transparent',
+                        borderRadius: 7,
+                        color: '#e2e8f0',
+                        cursor: 'pointer',
+                        textAlign: 'start',
+                        fontFamily: 'inherit',
+                        marginBlockEnd: 2,
+                      }}
+                      onMouseEnter={(e) => {
+                        if (!active)
+                          (e.currentTarget as HTMLButtonElement).style.background =
+                            'rgba(255,255,255,0.06)';
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!active)
+                          (e.currentTarget as HTMLButtonElement).style.background =
+                            'transparent';
+                      }}
+                    >
+                      <span aria-hidden>👤</span>
+                      <span
+                        style={{
+                          fontSize: size(12),
+                          fontWeight: 600,
+                          flex: 1,
+                          minWidth: 0,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {a.name}
+                      </span>
+                      {a.title ? (
+                        <span style={{ fontSize: size(10), opacity: 0.6 }}>
+                          {a.title}
+                        </span>
+                      ) : null}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
         <textarea
           dir="rtl"
           rows={1}
@@ -1288,6 +2058,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
         >
           {sending ? '…' : 'שלח'}
         </button>
+        </div>
       </footer>
     </aside>
     <TasksPanel

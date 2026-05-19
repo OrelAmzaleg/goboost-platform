@@ -172,6 +172,55 @@ export interface PaperclipIssue {
   updatedAt: string;
 }
 
+// ── Comment presentation + metadata (Stream 1 of CHAT_PANEL_DESIGN) ────────
+//
+// Paperclip distinguishes "system notice" comments from regular dialog via
+// the `presentation` jsonb. Without checking presentation we can't tell a
+// system notice (alert card) from an ordinary agent message (bubble) —
+// they both arrive in /api/issues/:id/comments. The shapes below mirror
+// Paperclip's `IssueCommentPresentation` and `IssueCommentMetadata` types
+// from packages/shared/src/types/issue.ts.
+
+export type PaperclipCommentPresentationKind = 'message' | 'system_notice';
+export type PaperclipCommentPresentationTone =
+  | 'neutral'
+  | 'info'
+  | 'success'
+  | 'warning'
+  | 'danger';
+
+export interface PaperclipCommentPresentation {
+  kind: PaperclipCommentPresentationKind;
+  tone: PaperclipCommentPresentationTone;
+  title?: string | null;
+  detailsDefaultOpen?: boolean;
+}
+
+export type PaperclipCommentMetadataRow =
+  | { type: 'text'; text: string; label?: string | null }
+  | { type: 'code'; code: string; language?: string | null; label?: string | null }
+  | { type: 'key_value'; label: string; value: string }
+  | {
+      type: 'issue_link';
+      issueId?: string | null;
+      identifier?: string | null;
+      title?: string | null;
+      label?: string | null;
+    }
+  | { type: 'agent_link'; agentId: string; name?: string | null; label?: string | null }
+  | { type: 'run_link'; runId: string; title?: string | null; label?: string | null };
+
+export interface PaperclipCommentMetadataSection {
+  title?: string | null;
+  rows: PaperclipCommentMetadataRow[];
+}
+
+export interface PaperclipCommentMetadata {
+  version: 1;
+  sourceRunId?: string | null;
+  sections: PaperclipCommentMetadataSection[];
+}
+
 export interface PaperclipComment {
   id: string;
   companyId: string;
@@ -187,8 +236,545 @@ export interface PaperclipComment {
    */
   createdByRunId: string | null;
   body: string;
+  /**
+   * Style hint set by Paperclip when the comment is a structured system
+   * notice (alert card, not dialog bubble). null/undefined → regular
+   * dialog message.
+   */
+  presentation: PaperclipCommentPresentation | null;
+  /**
+   * Optional structured rows (text, code, key-value, links) — Paperclip
+   * uses these inside system notices for richer rendering than plain
+   * markdown can carry.
+   */
+  metadata: PaperclipCommentMetadata | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// ── Thread interactions (Stream 2 of CHAT_PANEL_DESIGN) ────────────────────
+//
+// Structured agent → user prompts that demand a response before the issue
+// can continue: suggested task plans, follow-up questions, confirmations.
+// Backend table: `issue_thread_interactions`. Listed via
+//   GET /api/issues/:id/interactions
+// Responses go via
+//   POST /api/issues/:id/interactions/:interactionId/accept
+//   POST /api/issues/:id/interactions/:interactionId/reject
+
+export type PaperclipInteractionKind =
+  | 'suggest_tasks'
+  | 'ask_user_questions'
+  | 'request_confirmation';
+
+export type PaperclipInteractionStatus =
+  | 'pending'
+  | 'expired'
+  | 'accepted'
+  | 'rejected';
+
+export interface PaperclipThreadInteraction {
+  id: string;
+  issueId: string;
+  kind: PaperclipInteractionKind;
+  status: PaperclipInteractionStatus;
+  /** Shape varies per kind — questions list, suggested-tasks list, confirmation prompt. */
+  payload: Record<string, unknown> | null;
+  /** Set once the user has acted; mirrors payload structure for the response. */
+  result: Record<string, unknown> | null;
+  continuationPolicy?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
+
+export async function fetchIssueThreadInteractions(
+  issueId: string,
+): Promise<PaperclipThreadInteraction[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/interactions?limit=100`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipThreadInteraction[];
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      Array.isArray((raw as { interactions?: unknown }).interactions)
+    ) {
+      return (raw as { interactions: PaperclipThreadInteraction[] }).interactions;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueThreadInteractions failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Resolve an interaction. The Paperclip backend has 4 separate routes:
+ *   POST /accept   — body: { selectedClientKeys?: string[] }
+ *                    Used for suggest_tasks (pick which proposed tasks to
+ *                    actually create) and request_confirmation (empty body).
+ *   POST /reject   — body: { reason?: string }
+ *                    Used for any kind.
+ *   POST /respond  — body: { answers: [{questionId, optionIds}], summaryMarkdown? }
+ *                    Used specifically for ask_user_questions.
+ *   POST /cancel   — body: { reason?: string }
+ *                    Used when the *creator* (the agent) wants to retract.
+ *
+ * Client callers should usually use one of the four convenience wrappers
+ * below — `acceptInteraction`, `rejectInteraction`, `answerInteraction`,
+ * `cancelInteraction`. This generic `postInteractionAction` is exported
+ * for completeness but not normally needed.
+ */
+type InteractionAction = 'accept' | 'reject' | 'respond' | 'cancel';
+
+async function postInteractionAction(
+  issueId: string,
+  interactionId: string,
+  action: InteractionAction,
+  body: Record<string, unknown>,
+): Promise<PaperclipThreadInteraction | null> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/interactions/${encodeURIComponent(interactionId)}/${action}`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipThreadInteraction;
+  } catch (err) {
+    console.warn(`[PaperclipApi] postInteractionAction(${action}) failed:`, err);
+    return null;
+  }
+}
+
+export function acceptInteraction(
+  issueId: string,
+  interactionId: string,
+  selectedClientKeys?: string[],
+): Promise<PaperclipThreadInteraction | null> {
+  return postInteractionAction(
+    issueId,
+    interactionId,
+    'accept',
+    selectedClientKeys && selectedClientKeys.length > 0
+      ? { selectedClientKeys }
+      : {},
+  );
+}
+
+export function rejectInteraction(
+  issueId: string,
+  interactionId: string,
+  reason?: string,
+): Promise<PaperclipThreadInteraction | null> {
+  return postInteractionAction(
+    issueId,
+    interactionId,
+    'reject',
+    reason ? { reason } : {},
+  );
+}
+
+export interface QuestionAnswer {
+  questionId: string;
+  optionIds: string[];
+}
+
+export function answerInteraction(
+  issueId: string,
+  interactionId: string,
+  answers: QuestionAnswer[],
+  summaryMarkdown?: string | null,
+): Promise<PaperclipThreadInteraction | null> {
+  return postInteractionAction(issueId, interactionId, 'respond', {
+    answers,
+    ...(summaryMarkdown ? { summaryMarkdown } : {}),
+  });
+}
+
+export function cancelInteraction(
+  issueId: string,
+  interactionId: string,
+  reason?: string,
+): Promise<PaperclipThreadInteraction | null> {
+  return postInteractionAction(
+    issueId,
+    interactionId,
+    'cancel',
+    reason ? { reason } : {},
+  );
+}
+
+// ── Issue attachments (Stream 5 of CHAT_PANEL_DESIGN) ──────────────────────
+//
+// Files attached to an issue. When `issueCommentId` is set the file is the
+// "tail" of a specific comment (render inline under that bubble); otherwise
+// it's a standalone primitive in the timeline.
+
+export interface PaperclipAttachmentAsset {
+  id: string;
+  filename: string;
+  mimeType: string;
+  byteSize?: number | null;
+  width?: number | null;
+  height?: number | null;
+}
+
+/**
+ * Attachment shape returned by `/api/issues/:id/attachments`. Paperclip
+ * inlines the asset fields directly on the row using `originalFilename`,
+ * `contentType`, and `byteSize` (no nested `asset` object). We also keep
+ * the legacy `asset`/`filename`/`mimeType` fields so older payloads
+ * still work. Readers should prefer `originalFilename` over `filename`.
+ *
+ * `contentPath` is the relative download URL (e.g. `/api/attachments/:id/content`).
+ * We expose `attachmentContentUrl(id)` which builds the same URL with
+ * the configured base — they're interchangeable in practice.
+ */
+export interface PaperclipAttachment {
+  id: string;
+  issueId: string;
+  /** When set, this attachment is "owned" by a specific comment. */
+  issueCommentId: string | null;
+  assetId: string;
+  /** The original filename as uploaded — preferred display name. */
+  originalFilename?: string | null;
+  contentType?: string | null;
+  byteSize?: number | null;
+  /** Server-supplied download URL. May be relative. */
+  contentPath?: string | null;
+  /** Legacy nested shape — older API revisions used this. */
+  asset?: PaperclipAttachmentAsset | null;
+  filename?: string | null;
+  mimeType?: string | null;
+  /**
+   * Origin attribution — exactly one of these is typically populated.
+   * Used by the Tasks Panel to split attachments into:
+   *   • "תוצרים להורדה (הסוכן)"   ← createdByAgentId !== null
+   *   • "מסמכים מצורפים (אני)"    ← createdByUserId !== null && createdByAgentId === null
+   */
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+  createdAt: string;
+}
+
+export function attachmentContentUrl(attachmentId: string): string {
+  return `${moduleBaseUrl}/api/attachments/${encodeURIComponent(attachmentId)}/content`;
+}
+
+/**
+ * Convenience accessors — readers should use these instead of poking at
+ * the discriminated fields directly. They handle both the new flat shape
+ * (`originalFilename`, `contentType`) and the older nested shape (`asset.*`).
+ */
+export function attachmentFilename(att: PaperclipAttachment): string {
+  return (
+    att.originalFilename ??
+    att.asset?.filename ??
+    att.filename ??
+    `attachment-${att.id.slice(0, 6)}`
+  );
+}
+export function attachmentMimeType(att: PaperclipAttachment): string {
+  return att.contentType ?? att.asset?.mimeType ?? att.mimeType ?? '';
+}
+export function attachmentByteSize(att: PaperclipAttachment): number | null {
+  return att.byteSize ?? att.asset?.byteSize ?? null;
+}
+
+export async function fetchIssueAttachments(
+  issueId: string,
+): Promise<PaperclipAttachment[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/attachments?limit=100`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipAttachment[];
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      Array.isArray((raw as { attachments?: unknown }).attachments)
+    ) {
+      return (raw as { attachments: PaperclipAttachment[] }).attachments;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueAttachments failed:', err);
+    return [];
+  }
+}
+
+// ── Issue documents + revisions (Tasks Panel) ──────────────────────────────
+//
+// Documents are markdown/spec artifacts pinned to an issue. Each has a `key`
+// inside the issue (e.g. "plan", "spec") and a history of revisions.
+//   GET /api/issues/:id/documents
+//   GET /api/issues/:id/documents/:key/revisions
+
+export interface PaperclipDocumentSummary {
+  id: string;
+  documentId: string;
+  issueId: string;
+  key: string;
+  /** Some backends inline the latest revision body for convenience. */
+  latestRevision?: PaperclipDocumentRevision | null;
+  createdAt: string;
+}
+
+export interface PaperclipDocumentRevision {
+  id: string;
+  documentId: string;
+  revisionNumber: number;
+  body: string;
+  format: string;
+  changeSummary?: string | null;
+  createdByAgentId?: string | null;
+  createdByRunId?: string | null;
+  createdAt: string;
+}
+
+export async function fetchIssueDocuments(
+  issueId: string,
+): Promise<PaperclipDocumentSummary[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/documents?limit=100`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipDocumentSummary[];
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      Array.isArray((raw as { documents?: unknown }).documents)
+    ) {
+      return (raw as { documents: PaperclipDocumentSummary[] }).documents;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueDocuments failed:', err);
+    return [];
+  }
+}
+
+export async function fetchDocumentRevisions(
+  issueId: string,
+  key: string,
+): Promise<PaperclipDocumentRevision[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/documents/${encodeURIComponent(key)}/revisions?limit=50`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipDocumentRevision[];
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      Array.isArray((raw as { revisions?: unknown }).revisions)
+    ) {
+      return (raw as { revisions: PaperclipDocumentRevision[] }).revisions;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchDocumentRevisions failed:', err);
+    return [];
+  }
+}
+
+// ── Issue work products (Tasks Panel) ──────────────────────────────────────
+//
+// Downloadable agent outputs — spreadsheets, PDFs, generated docs. Each has
+// a public URL (asset.url) for direct download.
+//   GET /api/issues/:id/work-products
+
+export interface PaperclipWorkProduct {
+  id: string;
+  issueId: string;
+  type: string; // 'spreadsheet' | 'pdf' | 'doc' | ...
+  provider?: string | null;
+  externalId?: string | null;
+  title: string;
+  url?: string | null;
+  status?: string | null;
+  reviewState?: string | null;
+  isPrimary?: boolean;
+  healthStatus?: string | null;
+  createdByRunId?: string | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export async function fetchIssueWorkProducts(
+  issueId: string,
+): Promise<PaperclipWorkProduct[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/work-products?limit=100`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipWorkProduct[];
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      Array.isArray((raw as { workProducts?: unknown }).workProducts)
+    ) {
+      return (raw as { workProducts: PaperclipWorkProduct[] }).workProducts;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueWorkProducts failed:', err);
+    return [];
+  }
+}
+
+// ── Issue approvals (Tasks Panel) ──────────────────────────────────────────
+//
+// Approval gates linked to an issue. The approval itself lives in the
+// `approvals` table; the join table `issue_approvals` links it to the
+// issue. The list endpoint denormalizes for us.
+//   GET /api/issues/:id/approvals
+
+export type PaperclipApprovalStatus = 'pending' | 'approved' | 'rejected';
+
+export interface PaperclipApproval {
+  id: string;
+  type: string;
+  status: PaperclipApprovalStatus;
+  payload?: Record<string, unknown> | null;
+  decidedByUserId?: string | null;
+  decidedAt?: string | null;
+  createdAt: string;
+  /** Present when joined via issue_approvals. */
+  linkedByAgentId?: string | null;
+  linkedByUserId?: string | null;
+}
+
+export async function fetchIssueApprovals(
+  issueId: string,
+): Promise<PaperclipApproval[]> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/approvals?limit=100`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipApproval[];
+    if (
+      raw &&
+      typeof raw === 'object' &&
+      Array.isArray((raw as { approvals?: unknown }).approvals)
+    ) {
+      return (raw as { approvals: PaperclipApproval[] }).approvals;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueApprovals failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Approve or reject an approval gate. The endpoint pair is:
+ *   POST /approvals/:id/approve  → body: { decisionNote?: string }
+ *   POST /approvals/:id/reject   → same body
+ *
+ * The board user must be authenticated; the local_trusted dev path
+ * does this transparently. Returns the updated approval row.
+ */
+export async function resolveApproval(
+  approvalId: string,
+  decision: 'approve' | 'reject',
+  decisionNote?: string,
+): Promise<PaperclipApproval | null> {
+  const url = `${moduleBaseUrl}/api/approvals/${encodeURIComponent(approvalId)}/${decision}`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(decisionNote ? { decisionNote } : {}),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipApproval;
+  } catch (err) {
+    console.warn(`[PaperclipApi] resolveApproval(${decision}) failed:`, err);
+    return null;
+  }
+}
+
+/**
+ * Delete a work product. The endpoint is:
+ *   DELETE /work-products/:id
+ *
+ * No response body; we just resolve to `true` on success so callers can
+ * remove the row optimistically.
+ */
+export async function deleteWorkProduct(workProductId: string): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/work-products/${encodeURIComponent(workProductId)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    if (!r.ok && r.status !== 204) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return true;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteWorkProduct failed:', err);
+    return false;
+  }
+}
+
+/**
+ * Delete an issue attachment. The endpoint is:
+ *   DELETE /attachments/:attachmentId
+ *
+ * Used by the Tasks Panel to remove agent-generated files (PPT/PDF/DOCX)
+ * that the user no longer wants to keep around.
+ */
+export async function deleteAttachment(attachmentId: string): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/attachments/${encodeURIComponent(attachmentId)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    if (!r.ok && r.status !== 204) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return true;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteAttachment failed:', err);
+    return false;
+  }
+}
+
+/**
+ * Delete an issue document by key. The endpoint is:
+ *   DELETE /issues/:id/documents/:key
+ *
+ * Paperclip logs `issue.document_deleted` activity on success.
+ */
+export async function deleteIssueDocument(
+  issueId: string,
+  key: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}/documents/${encodeURIComponent(key)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    if (!r.ok && r.status !== 204) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return true;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteIssueDocument failed:', err);
+    return false;
+  }
 }
 
 // ── UUID ↔ numeric id mapping ─────────────────────────────────────────────
@@ -340,6 +926,64 @@ export function getAgentName(uuid: string | null | undefined): string | null {
 }
 
 /**
+ * Public-facing agent summary — minimum needed by the chat panel's assignee
+ * picker. Paperclip's `/api/companies/:id/agents` returns more fields; we
+ * keep the shape narrow on purpose.
+ */
+export interface PaperclipAgentSummary {
+  id: string;
+  name: string;
+  status: string;
+  title?: string | null;
+  reportsTo?: string | null;
+}
+
+/** List all agents in the active company. Used by the assignee picker. */
+export async function fetchCompanyAgents(): Promise<PaperclipAgentSummary[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/agents`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return (await r.json()) as PaperclipAgentSummary[];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanyAgents failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Change an issue's assignee. Paperclip's PATCH /issues/:id accepts a
+ * partial update — we only ever send the one field we care about so
+ * unrelated server-side fields aren't accidentally cleared.
+ *
+ * Side effects on the backend (per server/src/routes/issues.ts):
+ *   • Logs `issue.assignee_changed` activity.
+ *   • Calls `queueIssueAssignmentWakeup` for the new assignee.
+ */
+export async function updateIssueAssignee(
+  issueId: string,
+  assigneeAgentId: string,
+): Promise<PaperclipIssue | null> {
+  const url = `${moduleBaseUrl}/api/issues/${encodeURIComponent(issueId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assigneeAgentId }),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipIssue;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateIssueAssignee failed:', err);
+    return null;
+  }
+}
+
+/**
  * Create a new issue assigned to an agent — used by the "+" button in
  * the chat panel to start a brand-new conversation. We intentionally
  * keep the title minimal and the description empty: from the operator's
@@ -352,6 +996,10 @@ export async function createIssue(args: {
   assigneeAgentId: string;
   /** Status to start in. Defaults to 'todo' so heartbeats may pick it up. */
   status?: string;
+  /** Optional priority — Paperclip's vocab: low / medium / high / urgent. */
+  priority?: string;
+  /** Optional parent issue — used for sub-tasks under a plan. */
+  parentId?: string | null;
 }): Promise<PaperclipIssue | null> {
   if (!moduleCompanyId) {
     console.warn('[PaperclipApi] createIssue called before company is known');
@@ -367,6 +1015,8 @@ export async function createIssue(args: {
         description: args.description ?? '',
         assigneeAgentId: args.assigneeAgentId,
         status: args.status ?? 'todo',
+        ...(args.priority ? { priority: args.priority } : {}),
+        ...(args.parentId ? { parentId: args.parentId } : {}),
       }),
     });
     if (!r.ok) {
