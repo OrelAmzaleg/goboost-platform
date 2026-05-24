@@ -24,6 +24,7 @@ import {
   saveInstructionsFile,
   subscribeActivity,
   syncAgentSkills,
+  terminateAgent,
   updateAgent,
   updateAgentPermissions,
   upsertBudgetPolicy,
@@ -834,6 +835,125 @@ function ConfigurationTab({
             {saving ? 'שומר…' : 'שמור שינויים'}
           </button>
         </div>
+      </div>
+
+      {/* ── Danger Zone — destructive actions ─────────────────────
+          Session 7: ✕ Terminate moved off the AgentActionToolbar
+          (too close to everyday buttons → easy mis-click). It now
+          lives here, visually quarantined with red trim + explicit
+          confirm. */}
+      <DangerZone
+        agentName={agent.name}
+        agentId={agent.id}
+        onTerminated={async () => {
+          await onSaved();
+        }}
+      />
+    </div>
+  );
+}
+
+function DangerZone({
+  agentName,
+  agentId,
+  onTerminated,
+}: {
+  agentName: string;
+  agentId: string;
+  onTerminated: () => Promise<void> | void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const onTerminate = async () => {
+    const ok = window.confirm(
+      `להפסיק את הסוכן "${agentName}" לצמיתות?\n\n` +
+        'הסוכן יסומן כ-terminated ולא יוכל להריץ heartbeats חדשים. ' +
+        'שחזור אפשרי רק דרך הדשבורד של Paperclip. רוטינות פעילות שלו ' +
+        'יחדלו להפעיל אותו.',
+    );
+    if (!ok) return;
+    setBusy(true);
+    const success = await terminateAgent(agentId);
+    setBusy(false);
+    if (!success) {
+      window.alert('הפסקת הסוכן נכשלה. בדוק את הדשבורד של Paperclip.');
+      return;
+    }
+    await onTerminated();
+  };
+
+  return (
+    <div
+      style={{
+        marginBlockStart: 18,
+        background: 'rgba(127, 29, 29, 0.18)',
+        border: '1px solid rgba(239, 68, 68, 0.4)',
+        borderRadius: 10,
+        padding: 14,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 10,
+      }}
+    >
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 700,
+          letterSpacing: 0.5,
+          color: '#fecaca',
+          textTransform: 'uppercase',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+        }}
+      >
+        <span>⚠</span> אזור מסוכן
+      </div>
+      <div style={{ fontSize: 12, color: '#fca5a5', lineHeight: 1.5 }}>
+        פעולות בלתי-הפיכות. עצור והבן את ההשלכות לפני שלוחצים.
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          flexWrap: 'wrap',
+          padding: 10,
+          background: 'rgba(127, 29, 29, 0.28)',
+          border: '1px solid rgba(239, 68, 68, 0.45)',
+          borderRadius: 8,
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: '#fee2e2' }}>
+            הפסקת הסוכן
+          </div>
+          <div style={{ fontSize: 11, color: '#fca5a5', marginBlockStart: 4, lineHeight: 1.5 }}>
+            הסוכן יסומן כ-<code>terminated</code>. כל ה-heartbeats יחדלו.
+            הרוטינות שלו ימשיכו להופיע ברשימה אך לא יפעלו אותו. שחזור רק
+            דרך Paperclip.
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => void onTerminate()}
+          disabled={busy}
+          style={{
+            padding: '8px 16px',
+            borderRadius: 7,
+            border: '1px solid rgba(239, 68, 68, 0.7)',
+            background: 'rgba(239, 68, 68, 0.32)',
+            color: '#fee2e2',
+            fontSize: 12,
+            fontWeight: 700,
+            fontFamily: 'inherit',
+            cursor: busy ? 'not-allowed' : 'pointer',
+            opacity: busy ? 0.5 : 1,
+            flexShrink: 0,
+          }}
+        >
+          {busy ? 'מפסיק…' : '✕ הפסק סוכן'}
+        </button>
       </div>
     </div>
   );

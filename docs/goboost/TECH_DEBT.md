@@ -216,6 +216,116 @@ expose a UI for it either — it's a read-by-API field.
 
 ---
 
+## RoutinesModal · per-agent routines manager (Session 7)
+
+The Routines feature shipped in Session 7 covers the core CRUD +
+schedule triggers + runs/history end-to-end. The four items below are
+parts of Paperclip's full Routines feature that we knowingly cut from
+v1 — each one is non-trivial enough to deserve a dedicated session
+rather than being shoehorned into the initial build.
+
+### 1. Activity tab — placeholder (NOT IMPLEMENTED)
+
+**Status:** deferred (2026-05, Session 7).
+**Scope:** RoutinesModal → routine detail → Activity sub-tab.
+
+Paperclip's routine detail page has an "Activity" tab next to Triggers
+/ Runs / History. It surfaces the cross-cutting `activity_log` stream
+filtered by `entityType: routine | routine_trigger | routine_run`,
+showing every state change + actor + timestamp in a unified timeline.
+
+Our v1 ships with a 🚧 placeholder card in this tab because the
+filtering path requires the same activity-log infrastructure the
+chat panel uses (`subscribeActivity` already exists, but rendering
+it as a structured timeline — not raw events — needs a presentation
+layer we haven't built).
+
+- **Why deferred:** activity-log presentation isn't routine-specific —
+  it'll likely be reused by the issue detail panel, the agent runs
+  list, and others. Building it once for routines and forking later
+  is worse than building it as a shared primitive in a focused
+  session.
+- **Done =** a shared `ActivityTimeline` component fed by a filtered
+  `subscribeActivity` stream, plugged into the routines Activity tab
+  (and reusable for the others above).
+
+### 2. Webhook trigger editing UI — NOT IMPLEMENTED
+
+**Status:** deferred (2026-05, Session 7).
+**Scope:** RoutinesModal → Triggers tab → trigger row.
+
+Routines support three trigger kinds: `schedule` (cron), `webhook`
+(HTTP POST), and `api` (manual only). v1 implements creating + editing
+schedule triggers only. Webhook + api triggers DO render in the list
+when they exist (read-only with a "view in Paperclip" hint), but
+operators can't create/edit them here.
+
+Webhook triggers are non-trivial because the editor needs:
+- A `signingMode` picker (`bearer` | `hmac_sha256`)
+- A `replayWindowSec` field (30–86400)
+- A revealable webhook URL (uses `publicId`)
+- A "Rotate secret" button calling `POST /routine-triggers/:id/rotate-secret`
+  (with confirmation — the old secret is immediately invalidated)
+- Display of the most recent fire result (`lastResult`)
+
+- **Why deferred:** the secret-management UX (reveal once, rotate with
+  immediate invalidation) is the kind of dangerous flow that deserves
+  its own focused review rather than tacked onto the schedule editor.
+- **Done =** webhook-specific editor panel inside the trigger row,
+  reachable from `+ webhook trigger` button (alongside the existing
+  `+ schedule trigger`), with the secret-rotation confirmation +
+  copy-to-clipboard for the webhook URL.
+
+### 3. Variables editor — NOT IMPLEMENTED
+
+**Status:** deferred (2026-05, Session 7).
+**Scope:** RoutinesModal → routine detail → would be a "Variables" section.
+
+Routines have a `variables: RoutineVariable[]` field on the row.
+Each variable: `{ key, label, type: 'text'|'number'|'boolean'|'select', required?, defaultValue?, options? }`.
+At run-time the operator (or trigger payload) supplies values for
+these variables, which then get interpolated into the routine's
+instructions.
+
+The UI requires:
+- A repeating row editor (add/remove variables)
+- Per-row type picker → conditional rendering of defaultValue field
+  (text input vs number vs checkbox vs select with options sub-editor)
+- A "Run with variables" form on the Run Now button when variables exist
+
+- **Why deferred:** variables are an advanced feature most routines
+  won't use. The first usable iteration of routines doesn't need it.
+- **Done =** a Variables section in the detail view with the editor
+  above, plus the Run Now flow gaining a per-variable input form when
+  the routine has any required variables.
+
+### 4. Concurrency / CatchUp / Priority policies — NOT IMPLEMENTED
+
+**Status:** deferred (2026-05, Session 7).
+**Scope:** RoutinesModal → routine detail → "Advanced delivery settings"
+accordion.
+
+The routine row carries three advanced policy fields we didn't surface:
+- `concurrencyPolicy: 'coalesce_if_active' | 'skip_if_active' | 'always_enqueue'`
+  — what happens when a trigger fires while another run is in flight
+- `catchUpPolicy: 'skip_missed' | 'enqueue_missed_with_cap'`
+  — what happens to scheduled fires that were missed (e.g. service down)
+- `priority: 'critical' | 'high' | 'medium' | 'low'`
+  — execution priority among queued runs
+
+Paperclip's New Routine dialog stuffs these under an "Advanced
+delivery settings" accordion that defaults to collapsed.
+
+- **Why deferred:** sensible backend defaults (`coalesce_if_active`,
+  `skip_missed`, `medium`) work for the vast majority of routines.
+  Surfacing them would clutter the form without operator benefit in
+  the common case.
+- **Done =** a collapsed "Advanced delivery settings" accordion in
+  both the create form and the detail view, with three pickers + a
+  one-line explanation per option.
+
+---
+
 ## Earlier known gaps (still open)
 
 - **RunsAccordion has no history.** Paperclip exposes no

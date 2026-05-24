@@ -8,7 +8,6 @@ import {
   resumeAgent,
   subscribeActivity,
   subscribeRunStatus,
-  terminateAgent,
   uuidForNumericAgentId,
   wakeupAgent,
   type PaperclipAgentDetail,
@@ -77,6 +76,12 @@ interface AgentActionToolbarProps {
   panRef: React.RefObject<{ x: number; y: number }>;
   onOpenSettings: (agentUuid: string, numericId: number) => void;
   onAssignTask: (agentUuid: string, numericId: number) => void;
+  /**
+   * Open the per-agent routines modal (🔁 button). The button replaced
+   * the old ✕ Terminate at Session 7; Terminate now lives in the
+   * Configuration tab's Danger Zone.
+   */
+  onOpenRoutines: (agentUuid: string, numericId: number) => void;
   /** Pin an issue to the project-bookmarks bar — used by the ℹ popover. */
   onPinIssue?: (issue: PaperclipIssue) => void;
 }
@@ -93,6 +98,7 @@ export function AgentActionToolbar({
   panRef,
   onOpenSettings,
   onAssignTask,
+  onOpenRoutines,
   onPinIssue,
 }: AgentActionToolbarProps) {
   // RAF tick so we track the agent's world-coords every frame (pan,
@@ -311,13 +317,10 @@ export function AgentActionToolbar({
     }
   };
 
-  const onTerminate = async () => {
-    if (!window.confirm(`להפסיק את הסוכן "${agent?.name ?? ''}"?
-פעולה זו מסמנת את הסוכן כמופסק; ניתן יהיה לשחזר רק דרך הדשבורד של Paperclip.`)) {
-      return;
-    }
-    await runAction('terminate', () => terminateAgent(agentUuid), 'הפסקה');
-  };
+  // Session 7: ✕ Terminate moved to AgentManagementModal → Configuration
+  // → Danger Zone. The destructive action sat too close to the
+  // everyday buttons (Run, Pause, Assign) and an accidental click was
+  // too easy. The toolbar now has 🔁 Routines in its place.
 
   const displayName = agent?.name ?? '…';
 
@@ -481,14 +484,15 @@ export function AgentActionToolbar({
             accent="green"
             onClick={() => onAssignTask(agentUuid, targetId)}
           />
+          {/* 🔁 Routines — opens the per-agent RoutinesModal. Replaces
+              the ✕ Terminate that used to sit here (now relocated to
+              Configuration → Danger Zone). */}
           <ToolbarButton
-            title="הפסק סוכן"
-            icon="✕"
+            title="רוטינות"
+            icon="🔁"
             size={buttonSize}
             iconSize={iconFontSize}
-            accent="red"
-            disabled={actionInFlight === 'terminate'}
-            onClick={() => void onTerminate()}
+            onClick={() => onOpenRoutines(agentUuid, targetId)}
           />
         </div>
       ) : null}

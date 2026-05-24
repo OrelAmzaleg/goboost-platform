@@ -1652,6 +1652,493 @@ export async function cancelRun(runId: string): Promise<boolean> {
   }
 }
 
+// ── Routines (Session 7) ─────────────────────────────────────────
+//
+// Paperclip's recurring/triggered work mechanism. Each routine has:
+//   - core fields: title, description, assigneeAgentId, projectId
+//   - status: active | paused | archived (terminal)
+//   - one or more triggers (kind = schedule | webhook | api)
+//   - a history of runs (one per fire)
+//   - immutable revisions on every save
+//
+// Our v1 surface:
+//   - List + create + status toggle + delete (archive)
+//   - Edit title/description, run manually
+//   - Schedule triggers via a preset → cron translator (every day /
+//     hour / week / custom). Webhook + api kinds visible in the list
+//     but not editable here (webhook needs secret rotation UI).
+//   - Runs + Activity + History sub-tabs.
+//
+// No agentId server-side filter — `fetchCompanyRoutines` returns all,
+// caller filters by `assigneeAgentId` for the per-agent modal.
+
+export type PaperclipRoutineStatus = 'active' | 'paused' | 'archived';
+
+export type PaperclipRoutinePriority = 'critical' | 'high' | 'medium' | 'low';
+
+export type PaperclipRoutineConcurrency =
+  | 'coalesce_if_active'
+  | 'skip_if_active'
+  | 'always_enqueue';
+
+export type PaperclipRoutineCatchUp =
+  | 'skip_missed'
+  | 'enqueue_missed_with_cap';
+
+export interface PaperclipRoutineVariable {
+  key: string;
+  label?: string | null;
+  type: 'text' | 'number' | 'boolean' | 'select' | string;
+  required?: boolean;
+  defaultValue?: unknown;
+  options?: string[];
+}
+
+export interface PaperclipRoutine {
+  id: string;
+  companyId: string;
+  projectId?: string | null;
+  goalId?: string | null;
+  parentIssueId?: string | null;
+  title: string;
+  description?: string | null;
+  assigneeAgentId?: string | null;
+  priority: PaperclipRoutinePriority;
+  status: PaperclipRoutineStatus;
+  concurrencyPolicy?: PaperclipRoutineConcurrency;
+  catchUpPolicy?: PaperclipRoutineCatchUp;
+  variables?: PaperclipRoutineVariable[];
+  latestRevisionId?: string | null;
+  latestRevisionNumber?: number;
+  lastTriggeredAt?: string | null;
+  lastEnqueuedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** Some endpoints return triggers inline on the detail response. */
+  triggers?: PaperclipRoutineTrigger[];
+}
+
+export type PaperclipTriggerKind = 'schedule' | 'webhook' | 'api';
+
+export interface PaperclipRoutineTrigger {
+  id: string;
+  routineId: string;
+  kind: PaperclipTriggerKind | string;
+  label?: string | null;
+  enabled: boolean;
+  // Schedule fields
+  cronExpression?: string | null;
+  timezone?: string | null;
+  nextRunAt?: string | null;
+  lastFiredAt?: string | null;
+  // Webhook fields
+  publicId?: string | null;
+  signingMode?: 'bearer' | 'hmac_sha256' | string | null;
+  replayWindowSec?: number | null;
+  lastResult?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type PaperclipRoutineRunStatus =
+  | 'received'
+  | 'coalesced'
+  | 'skipped'
+  | 'issue_created'
+  | 'completed';
+
+export type PaperclipRoutineRunSource =
+  | 'schedule'
+  | 'manual'
+  | 'api'
+  | 'webhook';
+
+export interface PaperclipRoutineRun {
+  id: string;
+  companyId: string;
+  routineId: string;
+  triggerId?: string | null;
+  source: PaperclipRoutineRunSource | string;
+  status: PaperclipRoutineRunStatus | string;
+  triggeredAt: string;
+  completedAt?: string | null;
+  linkedIssueId?: string | null;
+  failureReason?: string | null;
+}
+
+export interface PaperclipRoutineRevision {
+  id: string;
+  routineId: string;
+  revisionNumber: number;
+  createdAt: string;
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+  changedKeys?: string[];
+  /** Free-form snapshot — the detail dialog shows the title/description. */
+  snapshot?: Record<string, unknown>;
+}
+
+// ── Routines: CRUD ──────────────────────────────────────────────
+
+export async function fetchCompanyRoutines(): Promise<PaperclipRoutine[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/routines`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipRoutine[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { routines?: unknown };
+      if (Array.isArray(obj.routines)) return obj.routines as PaperclipRoutine[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanyRoutines failed:', err);
+    return [];
+  }
+}
+
+export async function fetchRoutine(
+  routineId: string,
+): Promise<PaperclipRoutine | null> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipRoutine;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRoutine failed:', err);
+    return null;
+  }
+}
+
+export interface CreateRoutineInput {
+  title: string;
+  description?: string | null;
+  assigneeAgentId?: string | null;
+  projectId?: string | null;
+  goalId?: string | null;
+  parentIssueId?: string | null;
+  priority?: PaperclipRoutinePriority;
+  status?: PaperclipRoutineStatus;
+  concurrencyPolicy?: PaperclipRoutineConcurrency;
+  catchUpPolicy?: PaperclipRoutineCatchUp;
+  variables?: PaperclipRoutineVariable[];
+}
+
+export async function createRoutine(
+  input: CreateRoutineInput,
+): Promise<PaperclipRoutine | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/routines`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipRoutine;
+  } catch (err) {
+    console.warn('[PaperclipApi] createRoutine failed:', err);
+    return null;
+  }
+}
+
+export async function updateRoutine(
+  routineId: string,
+  patch: Partial<CreateRoutineInput>,
+): Promise<PaperclipRoutine | null> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipRoutine;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateRoutine failed:', err);
+    return null;
+  }
+}
+
+/** Delete = archive. Paperclip treats archived as terminal. */
+export async function deleteRoutine(routineId: string): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    if (r.ok) return true;
+    // Some installs reject hard delete; fall back to status=archived.
+    const patched = await updateRoutine(routineId, { status: 'archived' });
+    return patched != null;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteRoutine failed:', err);
+    return false;
+  }
+}
+
+/** Fire a manual run NOW. Returns the created run or null. */
+export async function runRoutineNow(
+  routineId: string,
+  opts: { triggerId?: string; payload?: Record<string, unknown> } = {},
+): Promise<PaperclipRoutineRun | null> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}/run`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'manual', ...opts }),
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipRoutineRun;
+  } catch (err) {
+    console.warn('[PaperclipApi] runRoutineNow failed:', err);
+    return null;
+  }
+}
+
+// ── Triggers ────────────────────────────────────────────────────
+
+export interface CreateScheduleTriggerInput {
+  kind: 'schedule';
+  cronExpression: string;
+  timezone?: string;
+  label?: string;
+  enabled?: boolean;
+}
+
+export interface CreateWebhookTriggerInput {
+  kind: 'webhook';
+  signingMode?: 'bearer' | 'hmac_sha256';
+  replayWindowSec?: number;
+  label?: string;
+  enabled?: boolean;
+}
+
+export interface CreateApiTriggerInput {
+  kind: 'api';
+  label?: string;
+  enabled?: boolean;
+}
+
+export type CreateTriggerInput =
+  | CreateScheduleTriggerInput
+  | CreateWebhookTriggerInput
+  | CreateApiTriggerInput;
+
+export async function createRoutineTrigger(
+  routineId: string,
+  input: CreateTriggerInput,
+): Promise<PaperclipRoutineTrigger | null> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}/triggers`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipRoutineTrigger;
+  } catch (err) {
+    console.warn('[PaperclipApi] createRoutineTrigger failed:', err);
+    return null;
+  }
+}
+
+export async function updateRoutineTrigger(
+  triggerId: string,
+  patch: Partial<{
+    cronExpression: string;
+    timezone: string;
+    enabled: boolean;
+    label: string;
+    signingMode: 'bearer' | 'hmac_sha256';
+    replayWindowSec: number;
+  }>,
+): Promise<PaperclipRoutineTrigger | null> {
+  const url = `${moduleBaseUrl}/api/routine-triggers/${encodeURIComponent(triggerId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipRoutineTrigger;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateRoutineTrigger failed:', err);
+    return null;
+  }
+}
+
+export async function deleteRoutineTrigger(
+  triggerId: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/routine-triggers/${encodeURIComponent(triggerId)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteRoutineTrigger failed:', err);
+    return false;
+  }
+}
+
+// ── Runs + Revisions ───────────────────────────────────────────
+
+export async function fetchRoutineRuns(
+  routineId: string,
+  limit = 50,
+): Promise<PaperclipRoutineRun[]> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}/runs?limit=${limit}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipRoutineRun[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { runs?: unknown };
+      if (Array.isArray(obj.runs)) return obj.runs as PaperclipRoutineRun[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRoutineRuns failed:', err);
+    return [];
+  }
+}
+
+export async function fetchRoutineRevisions(
+  routineId: string,
+): Promise<PaperclipRoutineRevision[]> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}/revisions`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipRoutineRevision[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { revisions?: unknown };
+      if (Array.isArray(obj.revisions))
+        return obj.revisions as PaperclipRoutineRevision[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRoutineRevisions failed:', err);
+    return [];
+  }
+}
+
+export async function restoreRoutineRevision(
+  routineId: string,
+  revisionId: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/routines/${encodeURIComponent(routineId)}/revisions/${encodeURIComponent(revisionId)}/restore`;
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] restoreRoutineRevision failed:', err);
+    return false;
+  }
+}
+
+// ── Cron preset helpers (Session 7 UI sugar) ────────────────────
+//
+// Translates between Paperclip's cron strings ("M H * * *") and the
+// UI's preset chooser. Daily / hourly / weekly / custom — matches the
+// dashboard screenshot's schedule editor.
+
+export type SchedulePreset = 'minutely' | 'hourly' | 'daily' | 'weekly' | 'custom';
+
+export interface ScheduleParts {
+  preset: SchedulePreset;
+  hour?: number; // 0..23
+  minute?: number; // 0..59
+  dayOfWeek?: number; // 0..6 (0 = Sunday)
+  customCron?: string;
+}
+
+/** Compose a cron string from preset + time bits. */
+export function partsToCron(parts: ScheduleParts): string {
+  const m = parts.minute ?? 0;
+  const h = parts.hour ?? 0;
+  const d = parts.dayOfWeek ?? 0;
+  switch (parts.preset) {
+    case 'minutely':
+      return '* * * * *';
+    case 'hourly':
+      return `${m} * * * *`;
+    case 'daily':
+      return `${m} ${h} * * *`;
+    case 'weekly':
+      return `${m} ${h} * * ${d}`;
+    case 'custom':
+      return (parts.customCron ?? '').trim();
+  }
+}
+
+/** Best-effort decode of common preset patterns. Falls back to 'custom'. */
+export function cronToParts(cron: string | null | undefined): ScheduleParts {
+  if (!cron) return { preset: 'daily', hour: 9, minute: 0 };
+  const trimmed = cron.trim();
+  const parts = trimmed.split(/\s+/);
+  if (parts.length !== 5) return { preset: 'custom', customCron: trimmed };
+  const [m, h, dom, mon, dow] = parts;
+  const mNum = Number(m);
+  const hNum = Number(h);
+  const dowNum = Number(dow);
+  if (trimmed === '* * * * *') return { preset: 'minutely' };
+  if (h === '*' && dom === '*' && mon === '*' && dow === '*' && Number.isFinite(mNum)) {
+    return { preset: 'hourly', minute: mNum };
+  }
+  if (dom === '*' && mon === '*' && dow === '*' && Number.isFinite(mNum) && Number.isFinite(hNum)) {
+    return { preset: 'daily', hour: hNum, minute: mNum };
+  }
+  if (
+    dom === '*' &&
+    mon === '*' &&
+    Number.isFinite(mNum) &&
+    Number.isFinite(hNum) &&
+    Number.isFinite(dowNum)
+  ) {
+    return { preset: 'weekly', hour: hNum, minute: mNum, dayOfWeek: dowNum };
+  }
+  return { preset: 'custom', customCron: trimmed };
+}
+
+/** Human-readable description for the schedule chip. */
+export function describeCron(cron: string | null | undefined): string {
+  if (!cron) return '—';
+  const p = cronToParts(cron);
+  const t = (h?: number, m?: number) =>
+    `${String(h ?? 0).padStart(2, '0')}:${String(m ?? 0).padStart(2, '0')}`;
+  const days = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+  switch (p.preset) {
+    case 'minutely':
+      return 'כל דקה';
+    case 'hourly':
+      return `כל שעה ב-:${String(p.minute ?? 0).padStart(2, '0')}`;
+    case 'daily':
+      return `כל יום ב-${t(p.hour, p.minute)}`;
+    case 'weekly':
+      return `כל ${days[p.dayOfWeek ?? 0] ?? '—'} ב-${t(p.hour, p.minute)}`;
+    case 'custom':
+      return `cron: ${p.customCron ?? cron}`;
+  }
+}
+
 // ── Agent configuration (Session 5) ──────────────────────────────
 //
 // Three endpoints live here, mirroring Paperclip's own Configuration

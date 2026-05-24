@@ -18,6 +18,7 @@ import { AgentManagementModal } from './components/AgentManagementModal.js';
 import { AssignTaskModal } from './components/AssignTaskModal.js';
 import { GoalsModal } from './components/GoalsModal.js';
 import { OrgChartModal } from './components/OrgChartModal.js';
+import { RoutinesModal } from './components/RoutinesModal.js';
 import { BottomToolbar } from './components/BottomToolbar.js';
 import { ProjectAddModal } from './components/ProjectAddModal.js';
 import { ProjectCreateModal } from './components/ProjectCreateModal.js';
@@ -315,6 +316,12 @@ function App() {
   // or by clicking a node in OrgChartModal. `null` = closed; otherwise
   // the agent's UUID.
   const [agentMgmtUuid, setAgentMgmtUuid] = useState<string | null>(null);
+  // Routines modal (Session 7) — opened by the 🔁 button in
+  // AgentActionToolbar. Filtered to routines whose assignee is this
+  // agent. `null` = closed.
+  const [routinesAgentUuid, setRoutinesAgentUuid] = useState<string | null>(
+    null,
+  );
   // Assign-task modal — driven by the ➕ button in AgentActionToolbar
   // AND by the "Ask CEO" path in NewAgentDialog (which reuses this
   // modal for the issue draft instead of carrying its own form).
@@ -626,6 +633,12 @@ function App() {
           }}
         />
       ) : null}
+      {routinesAgentUuid ? (
+        <RoutinesModal
+          agentUuid={routinesAgentUuid}
+          onClose={() => setRoutinesAgentUuid(null)}
+        />
+      ) : null}
 
       {!isDebugMode ? (
         <>
@@ -699,6 +712,7 @@ function App() {
             panRef={editor.panRef}
             onOpenSettings={(uuid) => setAgentMgmtUuid(uuid)}
             onAssignTask={(uuid) => setAssignTaskUuid(uuid)}
+            onOpenRoutines={(uuid) => setRoutinesAgentUuid(uuid)}
             onPinIssue={pinIssueAsBookmark}
           />
         </>
