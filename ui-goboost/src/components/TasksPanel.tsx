@@ -18,6 +18,7 @@ import {
   fetchIssueWorkProducts,
   getAgentName,
   subscribeActivity,
+  uploadIssueAttachment,
   type PaperclipApproval,
   type PaperclipAttachment,
   type PaperclipComment,
@@ -26,6 +27,12 @@ import {
   type PaperclipIssue,
   type PaperclipWorkProduct,
 } from '../paperclipApi.js';
+import {
+  humanBytes,
+  iconForMime,
+  validateAttachmentSize,
+} from './attachmentHelpers.js';
+import { statusColor, statusLabel } from './issuePresentation.js';
 import { MarkdownText } from './MarkdownText.js';
 
 /**
@@ -59,60 +66,52 @@ export interface TasksPanelProps {
   chatCollapsed: boolean;
   /** Pass-through `size(n)` from WhatsAppPanel so typography stays in sync. */
   size: (base: number) => number;
+  /**
+   * Jump the chat to another issue — used by clickable sub-issue rows in
+   * the "תכנית · צעדים" section. WhatsAppPanel wires this to its
+   * `onSelectNode` logic, which re-homes the office to the sub-issue's
+   * owner agent when needed.
+   */
+  onNavigateToIssue?: (issue: PaperclipIssue) => void;
 }
 
-function statusColor(status: string): string {
-  switch (status) {
-    case 'in_progress':
-      return '#3b82f6';
-    case 'in_review':
-      return '#f59e0b';
-    case 'blocked':
-      return '#fb923c';
-    case 'done':
-      return '#22c55e';
-    case 'cancelled':
-      return '#dc2626';
-    case 'todo':
-    case 'backlog':
-    default:
-      return '#94a3b8';
-  }
-}
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case 'backlog':
-      return 'תור';
-    case 'todo':
-      return 'לעשות';
-    case 'in_progress':
-      return 'בעבודה';
-    case 'in_review':
-      return 'בבדיקה';
-    case 'blocked':
-      return 'חסום';
-    case 'done':
-      return 'הושלם';
-    case 'cancelled':
-      return 'בוטל';
-    default:
-      return status;
-  }
-}
+// `statusColor` / `statusLabel` now live in ./issuePresentation.ts.
 
 function IssueRow({
   it,
   size,
   highlight = false,
+  onClick,
 }: {
   it: PaperclipIssue;
   size: (base: number) => number;
   highlight?: boolean;
+  /**
+   * When provided, the row becomes a clickable button — used by the
+   * "תכנית · צעדים" section so the operator can jump the chat to a
+   * sub-issue. The highlighted active-issue row passes no `onClick`
+   * and stays a static panel.
+   */
+  onClick?: (it: PaperclipIssue) => void;
 }) {
   const assigneeName = getAgentName(it.assigneeAgentId) ?? null;
+  const clickable = !!onClick;
   return (
     <div
+      onClick={clickable ? () => onClick!(it) : undefined}
+      role={clickable ? 'button' : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      onKeyDown={
+        clickable
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onClick!(it);
+              }
+            }
+          : undefined
+      }
+      title={clickable ? `פתח את ${it.identifier ?? ''} בצ'אט` : undefined}
       style={{
         display: 'flex',
         flexDirection: 'column',
@@ -123,7 +122,25 @@ function IssueRow({
           ? '1px solid rgba(129,140,248,0.5)'
           : '1px solid rgba(255,255,255,0.06)',
         borderRadius: 8,
+        cursor: clickable ? 'pointer' : 'default',
+        transition: 'background 0.12s',
       }}
+      onMouseEnter={
+        clickable
+          ? (e) => {
+              (e.currentTarget as HTMLDivElement).style.background =
+                'rgba(255,255,255,0.09)';
+            }
+          : undefined
+      }
+      onMouseLeave={
+        clickable
+          ? (e) => {
+              (e.currentTarget as HTMLDivElement).style.background =
+                'rgba(255,255,255,0.04)';
+            }
+          : undefined
+      }
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <span
@@ -194,6 +211,7 @@ export function TasksPanel({
   onClose,
   chatCollapsed,
   size,
+  onNavigateToIssue,
 }: TasksPanelProps) {
   const [parent, setParent] = useState<PaperclipIssue | null>(null);
   const [children, setChildren] = useState<PaperclipIssue[]>([]);
@@ -324,6 +342,61 @@ export function TasksPanel({
 
   // Remove an attachment (downloadable file like PPT/PDF/DOCX that the
   // agent emitted). Same pattern as work products.
+  // Direct attachment upload from the "מסמכים מצורפים" section. Unlike
+  // the chat composer, this does NOT post a comment — it just adds the
+  // file to the issue's knowledge base. No comment means no heartbeat
+  // wake, so the operator can stock reference docs without nudging the
+  // agent. Paperclip exposes the same `/attachments` endpoint; we just
+  // omit `issueCommentId`.
+  const [uploadingUserAtt, setUploadingUserAtt] = useState(false);
+  const [userAttError, setUserAttError] = useState<string | null>(null);
+  // Attachment ids that THIS panel uploaded as user reference docs.
+  // The agent/user split heuristic (`looksAgentEmitted`) time-correlates
+  // against heartbeat comments and could mis-bucket a doc uploaded while
+  // the agent happens to be running. Tracking explicit user uploads
+  // overrides that heuristic for the current session.
+  const [userUploadedIds, setUserUploadedIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const onAddUserAttachments = async (
+    files: FileList | File[] | null | undefined,
+  ) => {
+    if (!issue || !files) return;
+    const arr = Array.from(files);
+    if (arr.length === 0) return;
+    // Reject the whole batch if any file fails the size cap — keeps
+    // the interaction simple (no partial-staging UI in this panel).
+    const oversize = arr.find((f) => !validateAttachmentSize(f).ok);
+    if (oversize) {
+      setUserAttError(
+        validateAttachmentSize(oversize).error ?? 'קובץ גדול מדי',
+      );
+      return;
+    }
+    setUploadingUserAtt(true);
+    setUserAttError(null);
+    const results = await Promise.all(
+      arr.map((f) => uploadIssueAttachment(issue.id, f)),
+    );
+    setUploadingUserAtt(false);
+    const succeeded = results.filter(
+      (a): a is PaperclipAttachment => a != null,
+    );
+    if (succeeded.length > 0) {
+      setAttachments((prev) => [...prev, ...succeeded]);
+      setUserUploadedIds((prev) => {
+        const next = new Set(prev);
+        for (const a of succeeded) next.add(a.id);
+        return next;
+      });
+    }
+    if (succeeded.length < arr.length) {
+      setUserAttError(
+        `${arr.length - succeeded.length} מתוך ${arr.length} קבצים נכשלו בהעלאה.`,
+      );
+    }
+  };
+
   const [removingAttId, setRemovingAttId] = useState<string | null>(null);
   const removeAttachment = async (att: PaperclipAttachment) => {
     const name = att.asset?.filename ?? att.filename ?? 'הקובץ';
@@ -356,6 +429,9 @@ export function TasksPanel({
     .filter((t) => Number.isFinite(t));
 
   function looksAgentEmitted(att: PaperclipAttachment): boolean {
+    // Explicit user uploads from this panel always count as user docs,
+    // regardless of what the time-correlation heuristic would say.
+    if (userUploadedIds.has(att.id)) return false;
     if (att.createdByAgentId) return true;
     const t = new Date(att.createdAt).getTime();
     if (!Number.isFinite(t)) return false;
@@ -369,25 +445,8 @@ export function TasksPanel({
     (a) => !looksAgentEmitted(a),
   );
 
-  function humanBytes(b?: number | null): string | null {
-    if (b == null || !Number.isFinite(b)) return null;
-    if (b < 1024) return `${b} B`;
-    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
-    if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(b / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
-  function iconForMime(mime: string): string {
-    if (/^image\//.test(mime)) return '🖼';
-    if (/pdf$/.test(mime)) return '📕';
-    if (/word|officedocument\.wordprocessing/.test(mime)) return '📘';
-    if (/spreadsheet|excel|csv/.test(mime)) return '📊';
-    if (/presentation|powerpoint/.test(mime)) return '📙';
-    if (/zip|tar|gzip|7z|rar/.test(mime)) return '🗜';
-    if (/audio\//.test(mime)) return '🎵';
-    if (/video\//.test(mime)) return '🎬';
-    if (/text\//.test(mime)) return '📄';
-    return '📎';
-  }
+  // `humanBytes` and `iconForMime` now live in ./attachmentHelpers.ts so
+  // the upload form, chips, and Tasks Panel all share one vocabulary.
 
   // Live refresh — when activity fires for our streams, refetch.
   // Same logic as WhatsAppPanel's activity handler: approvals fire
@@ -497,7 +556,8 @@ export function TasksPanel({
       style={
         {
           position: 'fixed',
-          top: 38,
+          // 38 connection banner + 38 bookmarks bar.
+          top: 76,
           right: anchorRight,
           bottom: 0,
           width: TASKS_PANEL_WIDTH,
@@ -700,9 +760,16 @@ export function TasksPanel({
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {children.map((c) => (
-                    <IssueRow key={c.id} it={c} size={size} />
-                  ))}
+                  <CollapsibleList size={size}>
+                    {children.map((c) => (
+                      <IssueRow
+                        key={c.id}
+                        it={c}
+                        size={size}
+                        onClick={onNavigateToIssue}
+                      />
+                    ))}
+                  </CollapsibleList>
                 </div>
               )}
             </section>
@@ -755,6 +822,7 @@ export function TasksPanel({
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <CollapsibleList size={size}>
                   {documents.map((doc) => {
                     const expanded = expandedDocKey === doc.key;
                     const revs = docRevisions[doc.key] ?? [];
@@ -893,6 +961,7 @@ export function TasksPanel({
                       </div>
                     );
                   })}
+                  </CollapsibleList>
                 </div>
               )}
             </section>
@@ -944,6 +1013,7 @@ export function TasksPanel({
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <CollapsibleList size={size}>
                   {/* Attachments emitted by the agent during a run. */}
                   {agentAttachments.map((att) => {
                     const filename = attachmentFilename(att);
@@ -1126,6 +1196,7 @@ export function TasksPanel({
                       </DocIconButton>
                     </div>
                   ))}
+                  </CollapsibleList>
                 </div>
               )}
             </section>
@@ -1135,7 +1206,17 @@ export function TasksPanel({
                 Paperclip dashboard — distinct from agent-produced
                 downloadables above. Provides shared context (briefs,
                 spec PDFs, screenshots) the agent can read from. */}
-            <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <section
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                void onAddUserAttachments(e.dataTransfer.files);
+              }}
+              style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+            >
               <div
                 style={{
                   fontSize: size(11),
@@ -1161,7 +1242,53 @@ export function TasksPanel({
                     {userAttachments.length}
                   </span>
                 ) : null}
+                {/* Direct upload — adds to the issue knowledge base
+                    without posting a comment (no heartbeat wake). */}
+                <label
+                  title="צרף מסמך — מתווסף ל-Issue ללא שליחת הודעה"
+                  style={{
+                    marginInlineStart: 'auto',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    padding: '2px 8px',
+                    background: 'rgba(99,102,241,0.22)',
+                    border: '1px solid rgba(129,140,248,0.45)',
+                    borderRadius: 7,
+                    color: '#e0e7ff',
+                    cursor: uploadingUserAtt ? 'not-allowed' : 'pointer',
+                    opacity: uploadingUserAtt ? 0.6 : 1,
+                    fontSize: size(10),
+                    fontWeight: 700,
+                  }}
+                >
+                  <span aria-hidden style={{ fontSize: size(11) }}>＋</span>
+                  <span>{uploadingUserAtt ? 'מעלה…' : 'צרף מסמך'}</span>
+                  <input
+                    type="file"
+                    multiple
+                    hidden
+                    disabled={uploadingUserAtt}
+                    onChange={(e) => {
+                      void onAddUserAttachments(e.target.files);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
               </div>
+              {userAttError ? (
+                <div
+                  style={{
+                    fontSize: size(11),
+                    color: '#fecaca',
+                    background: 'rgba(127,29,29,0.4)',
+                    padding: '4px 8px',
+                    borderRadius: 6,
+                  }}
+                >
+                  {userAttError}
+                </div>
+              ) : null}
               {loadingSideStreams ? (
                 <div style={{ fontSize: size(12), opacity: 0.6 }}>טוען…</div>
               ) : userAttachments.length === 0 ? (
@@ -1175,10 +1302,11 @@ export function TasksPanel({
                     borderRadius: 8,
                   }}
                 >
-                  לא צורפו מסמכי הקשר עדיין.
+                  לא צורפו מסמכי הקשר עדיין. לחץ "צרף מסמך" או גרור קבצים לכאן.
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <CollapsibleList size={size}>
                   {userAttachments.map((att) => {
                     const filename = attachmentFilename(att);
                     const mime = attachmentMimeType(att);
@@ -1270,6 +1398,7 @@ export function TasksPanel({
                       </div>
                     );
                   })}
+                  </CollapsibleList>
                 </div>
               )}
             </section>
@@ -1322,6 +1451,7 @@ export function TasksPanel({
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <CollapsibleList size={size}>
                   {approvals.map((a) => {
                     const tone =
                       a.status === 'approved'
@@ -1428,6 +1558,7 @@ export function TasksPanel({
                       </div>
                     );
                   })}
+                  </CollapsibleList>
                 </div>
               )}
             </section>
@@ -1589,6 +1720,103 @@ export function TasksPanel({
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * CollapsibleList — modern "show more" pattern for long item lists.
+ *
+ * When there are more items than `previewCount` (default 2), only the
+ * first N are shown. The LAST item of the preview is rendered at
+ * reduced opacity (with a soft fade-out mask) so the user gets a
+ * visual hint that the list continues. A subtle chevron-pill below
+ * toggles between the preview and the full list.
+ *
+ * Used by each section in the Tasks Panel so long backlogs (plans with
+ * many steps, dozens of approvals, etc.) don't push the rest of the
+ * panel off-screen.
+ */
+function CollapsibleList({
+  children,
+  previewCount = 2,
+  size,
+  labelMore = 'הצג עוד',
+  labelLess = 'הצג פחות',
+}: {
+  children: React.ReactNode[];
+  previewCount?: number;
+  size: (base: number) => number;
+  labelMore?: string;
+  labelLess?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const total = children.length;
+  if (total <= previewCount) {
+    return <>{children}</>;
+  }
+  const visible = open ? children : children.slice(0, previewCount);
+  const hiddenCount = total - previewCount;
+  return (
+    <>
+      {visible.map((child, i) => {
+        // Last preview slot is faded — visual hint that more rows
+        // are tucked behind the toggle. A linear-gradient mask
+        // softens the bottom edge so it looks intentional rather
+        // than a CSS bug.
+        const fade = !open && i === previewCount - 1;
+        return (
+          <div
+            key={`cl:${i}`}
+            style={{
+              opacity: fade ? 0.45 : 1,
+              transition: 'opacity 0.2s',
+              maskImage: fade
+                ? 'linear-gradient(to bottom, #000 55%, rgba(0,0,0,0.35) 100%)'
+                : undefined,
+              WebkitMaskImage: fade
+                ? 'linear-gradient(to bottom, #000 55%, rgba(0,0,0,0.35) 100%)'
+                : undefined,
+              pointerEvents: fade ? 'none' : undefined,
+            }}
+          >
+            {child}
+          </div>
+        );
+      })}
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          alignSelf: 'center',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '4px 12px',
+          background: 'transparent',
+          border: '1px solid rgba(255,255,255,0.1)',
+          borderRadius: 999,
+          color: '#cbd5e1',
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+          fontSize: size(11),
+          fontWeight: 600,
+          marginBlockStart: 2,
+          transition: 'background 0.15s, color 0.15s',
+        }}
+        onMouseEnter={(e) => {
+          (e.currentTarget as HTMLButtonElement).style.background =
+            'rgba(255,255,255,0.06)';
+          (e.currentTarget as HTMLButtonElement).style.color = '#f1f5f9';
+        }}
+        onMouseLeave={(e) => {
+          (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
+          (e.currentTarget as HTMLButtonElement).style.color = '#cbd5e1';
+        }}
+      >
+        <span style={{ fontSize: size(9) }}>{open ? '▲' : '▼'}</span>
+        <span>{open ? labelLess : `${labelMore} (${hiddenCount})`}</span>
+      </button>
+    </>
+  );
+}
 
 /**
  * Compact icon button used by the documents row for the eye/download/

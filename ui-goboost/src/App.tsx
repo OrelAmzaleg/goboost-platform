@@ -1,7 +1,27 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import {
+  activeScopeOf,
+  availableProjects,
+  GENERAL_BOOKMARK_ID,
+  issueBookmarkId,
+  loadArrangement,
+  projectBookmarkId,
+  reconcileBookmarks,
+  saveArrangement,
+  seedArrangement,
+  type BookmarkArrangement,
+} from './bookmarks.js';
 import { toMajorMinor } from './changelogData.js';
+import { BookmarksBar } from './components/BookmarksBar.js';
+import { AgentManagementModal } from './components/AgentManagementModal.js';
+import { AssignTaskModal } from './components/AssignTaskModal.js';
+import { GoalsModal } from './components/GoalsModal.js';
+import { OrgChartModal } from './components/OrgChartModal.js';
 import { BottomToolbar } from './components/BottomToolbar.js';
+import { ProjectAddModal } from './components/ProjectAddModal.js';
+import { ProjectCreateModal } from './components/ProjectCreateModal.js';
+import { ProjectEditModal } from './components/ProjectEditModal.js';
 import { WhatsAppPanel } from './components/WhatsAppPanel.js';
 import { ChangelogModal } from './components/ChangelogModal.js';
 import { DebugView } from './components/DebugView.js';
@@ -15,15 +35,32 @@ import { ZoomControls } from './components/ZoomControls.js';
 import { useEditorActions } from './hooks/useEditorActions.js';
 import { useEditorKeyboard } from './hooks/useEditorKeyboard.js';
 import { useExtensionMessages } from './hooks/useExtensionMessages.js';
+import { startAgentSpeechBridge } from './office/agentSpeechBridge.js';
 import { OfficeCanvas } from './office/components/OfficeCanvas.js';
+import { AgentActionToolbar } from './office/components/AgentActionToolbar.js';
 import { ToolOverlay } from './office/components/ToolOverlay.js';
 import { EditorState } from './office/editor/editorState.js';
 import { EditorToolbar } from './office/editor/EditorToolbar.js';
 import { OfficeState } from './office/engine/officeState.js';
 import { isRotatable } from './office/layout/furnitureCatalog.js';
 import { EditTool } from './office/types.js';
+import {
+  fetchCompanyProjects,
+  getActiveCompanyId,
+  subscribeActivity,
+  type PaperclipIssue,
+  type PaperclipProject,
+} from './paperclipApi.js';
 import { isBrowserRuntime } from './runtime.js';
 import { vscode } from './vscodeApi.js';
+
+// Height of the connection banner (#gb-bootstrap-banner, fixed at top).
+const CONNECTION_BANNER_HEIGHT = 38;
+// Height of the bookmarks bar (px).
+const BOOKMARKS_BAR_HEIGHT = 38;
+// The whole interface (office canvas + overlays) starts below the banner
+// and the bookmarks bar. Fixed panels use the same offset for their `top`.
+const CONTENT_TOP_OFFSET = CONNECTION_BANNER_HEIGHT + BOOKMARKS_BAR_HEIGHT;
 
 // Game state lives outside React — updated imperatively by message handlers
 const officeStateRef = { current: null as OfficeState | null };
@@ -37,6 +74,17 @@ function getOfficeState(): OfficeState {
 }
 
 function App() {
+  // ── Projects / bookmarks state ────────────────────────────────────────────
+  // `paperclipReady` flips true once the WS handshake completes — only then
+  // is `getActiveCompanyId()` populated, so project loading waits on it.
+  const [paperclipReady, setPaperclipReady] = useState(false);
+  const [projects, setProjects] = useState<PaperclipProject[]>([]);
+  // The per-company bookmark arrangement (order / pins / issue-pins / active).
+  // Loaded from localStorage once the company id is known.
+  const [arrangement, setArrangement] = useState<BookmarkArrangement | null>(
+    null,
+  );
+
   // Browser runtime (dev or static dist): load static assets via browserMock,
   // then connect to Paperclip via paperclipApi for live agent events.
   // The two are complementary: browserMock loads sprites/floors/walls/layout
@@ -52,6 +100,7 @@ function App() {
 
     let stopped = false;
     let handle: import('./paperclipApi.js').PaperclipApiHandle | null = null;
+    let stopSpeechBridge: (() => void) | null = null;
 
     void (async () => {
       const { dispatchMockMessages } = await import('./browserMock.js');
@@ -64,6 +113,18 @@ function App() {
       handle = await startPaperclipApi({
         baseUrl,
         onStatusChange: (status) => {
+          // Once connected, the company id is populated — unblock the
+          // bookmarks/projects load.
+          if (status.state === 'connected') {
+            setPaperclipReady(true);
+            // Boot the speech bridge once — it subscribes to global
+            // heartbeat/activity streams and dispatches text bubbles
+            // onto the office canvas. Idempotent guard: only start the
+            // first time we hit `connected` for this effect.
+            if (!stopSpeechBridge && !stopped) {
+              stopSpeechBridge = startAgentSpeechBridge(getOfficeState);
+            }
+          }
           // Reflect connection status into the bootstrap banner so the operator
           // can see at a glance whether Paperclip is connected. Banner element
           // is defined in index.html (#gb-bootstrap-banner .gb-left).
@@ -90,8 +151,189 @@ function App() {
     return () => {
       stopped = true;
       if (handle) handle.stop();
+      if (stopSpeechBridge) {
+        stopSpeechBridge();
+        stopSpeechBridge = null;
+      }
     };
   }, []);
+
+  // ── Bookmarks: load projects + arrangement once Paperclip is connected ────
+  // A first-time user (no stored arrangement) gets every project seeded
+  // into the bar; from then on the bar is curated by hand.
+  useEffect(() => {
+    if (!paperclipReady) return;
+    const companyId = getActiveCompanyId();
+    if (!companyId) return;
+    let cancelled = false;
+    const stored = loadArrangement(companyId);
+    void fetchCompanyProjects().then((list) => {
+      if (cancelled) return;
+      setProjects(list);
+      if (stored) {
+        setArrangement(stored);
+      } else {
+        const seeded = seedArrangement(list);
+        setArrangement(seeded);
+        saveArrangement(companyId, seeded);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [paperclipReady]);
+
+  // Live project updates — refetch on any `project.*` activity.
+  useEffect(() => {
+    if (!paperclipReady) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = subscribeActivity((payload) => {
+      if (String(payload.entityType ?? '') !== 'project') return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        void fetchCompanyProjects().then(setProjects);
+      }, 800);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+    };
+  }, [paperclipReady]);
+
+  // A safe fallback arrangement for the window before the real one loads.
+  const effectiveArrangement: BookmarkArrangement = arrangement ?? {
+    order: [GENERAL_BOOKMARK_ID],
+    issuePins: [],
+    activeId: GENERAL_BOOKMARK_ID,
+  };
+
+  const bookmarks = useMemo(
+    () => reconcileBookmarks(effectiveArrangement, projects),
+    [effectiveArrangement, projects],
+  );
+  const addableProjects = useMemo(
+    () => availableProjects(effectiveArrangement, projects),
+    [effectiveArrangement, projects],
+  );
+  const activeBookmarkId = effectiveArrangement.activeId;
+  const activeScope = useMemo(
+    () => activeScopeOf(effectiveArrangement, bookmarks),
+    [effectiveArrangement, bookmarks],
+  );
+
+  // All arrangement mutators use the functional setState form so they
+  // never capture a stale closure, and persist on every change.
+  const onSelectBookmark = useCallback(
+    (id: string) => {
+      setArrangement((cur) => {
+        const base = cur ?? effectiveArrangement;
+        const next = { ...base, activeId: id };
+        const companyId = getActiveCompanyId();
+        if (companyId) saveArrangement(companyId, next);
+        return next;
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+  const onReorderBookmarks = useCallback((orderedIds: string[]) => {
+    setArrangement((cur) => {
+      if (!cur) return cur;
+      const next = { ...cur, order: orderedIds };
+      const companyId = getActiveCompanyId();
+      if (companyId) saveArrangement(companyId, next);
+      return next;
+    });
+  }, []);
+  const onRemoveBookmark = useCallback((id: string) => {
+    setArrangement((cur) => {
+      if (!cur) return cur;
+      const next: BookmarkArrangement = {
+        order: cur.order.filter((o) => o !== id),
+        issuePins: cur.issuePins.filter(
+          (p) => issueBookmarkId(p.issueId) !== id,
+        ),
+        activeId:
+          cur.activeId === id ? GENERAL_BOOKMARK_ID : cur.activeId,
+      };
+      const companyId = getActiveCompanyId();
+      if (companyId) saveArrangement(companyId, next);
+      return next;
+    });
+  }, []);
+  // Add an existing project's tab to the bar (and select it).
+  const onAddProject = useCallback((projectId: string) => {
+    setArrangement((cur) => {
+      if (!cur) return cur;
+      const id = projectBookmarkId(projectId);
+      if (cur.order.includes(id)) {
+        return { ...cur, activeId: id };
+      }
+      const next = { ...cur, order: [...cur.order, id], activeId: id };
+      const companyId = getActiveCompanyId();
+      if (companyId) saveArrangement(companyId, next);
+      return next;
+    });
+  }, []);
+
+  // Pin the chat's active issue as a new issue-scope bookmark.
+  const pinIssueAsBookmark = useCallback((issue: PaperclipIssue) => {
+    setArrangement((cur) => {
+      if (!cur) return cur;
+      const id = issueBookmarkId(issue.id);
+      let next: BookmarkArrangement;
+      if (cur.issuePins.some((p) => p.issueId === issue.id)) {
+        next = { ...cur, activeId: id };
+      } else {
+        const label = `${issue.identifier ?? '—'} · ${issue.title}`;
+        next = {
+          order: [...cur.order, id],
+          issuePins: [...cur.issuePins, { issueId: issue.id, label }],
+          activeId: id,
+        };
+      }
+      const companyId = getActiveCompanyId();
+      if (companyId) saveArrangement(companyId, next);
+      return next;
+    });
+  }, []);
+
+  // ── Project create / edit modals ──────────────────────────────────────────
+  // `editingProjectId` non-null → edit modal open; `creatingProject` →
+  // create modal open. Wired to the bar's ✏ and + → "new project".
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [editingProjectId, setEditingProjectId] = useState<string | null>(
+    null,
+  );
+  // The "+" add-project modal (list of addable projects + create-new).
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  // Goals modal — independent of bookmarks; opened by the 🎯 button.
+  const [goalsOpen, setGoalsOpen] = useState(false);
+  // Org-chart modal — opened by the 🏢 button.
+  const [orgChartOpen, setOrgChartOpen] = useState(false);
+  // Agent management modal — driven by the ⚙ button in AgentActionToolbar
+  // or by clicking a node in OrgChartModal. `null` = closed; otherwise
+  // the agent's UUID.
+  const [agentMgmtUuid, setAgentMgmtUuid] = useState<string | null>(null);
+  // Assign-task modal — driven by the ➕ button in AgentActionToolbar
+  // AND by the "Ask CEO" path in NewAgentDialog (which reuses this
+  // modal for the issue draft instead of carrying its own form).
+  const [assignTaskUuid, setAssignTaskUuid] = useState<string | null>(null);
+  const [assignTaskPrefill, setAssignTaskPrefill] = useState<{
+    title?: string;
+    description?: string;
+    contextHint?: string;
+  } | null>(null);
+  // Refetch projects + (for create) drop the new tab into the bar.
+  const onProjectsChanged = useCallback(
+    (focusProjectId?: string) => {
+      void fetchCompanyProjects().then((list) => {
+        setProjects(list);
+        if (focusProjectId) onAddProject(focusProjectId);
+      });
+    },
+    [onAddProject],
+  );
 
   const editor = useEditorActions(getOfficeState, editorState);
 
@@ -236,7 +478,21 @@ function App() {
       : null;
 
   return (
-    <div ref={containerRef} className="w-full h-full relative overflow-hidden">
+    <div
+      ref={containerRef}
+      className="overflow-hidden"
+      style={{
+        // The interface begins below the connection banner + bookmarks
+        // bar — neither of which should ever overlap the office canvas
+        // or the chat panel. `absolute` keeps it a positioned ancestor so
+        // descendants' `inset-0` still resolve against this box.
+        position: 'absolute',
+        top: CONTENT_TOP_OFFSET,
+        left: 0,
+        right: 0,
+        bottom: 0,
+      }}
+    >
       <OfficeCanvas
         officeState={officeState}
         onClick={handleClick}
@@ -254,9 +510,122 @@ function App() {
         panRef={editor.panRef}
       />
 
+      {/* GoBoost project bookmarks — full-width scope strip below the
+          connection banner. Switching a tab re-filters every agent's
+          issue forest in the chat panel. */}
+      <BookmarksBar
+        bookmarks={bookmarks}
+        activeId={activeBookmarkId}
+        height={BOOKMARKS_BAR_HEIGHT}
+        onSelect={onSelectBookmark}
+        onReorder={onReorderBookmarks}
+        onRemove={onRemoveBookmark}
+        onEditProject={(projectId) => setEditingProjectId(projectId)}
+        onOpenAddMenu={() => setAddMenuOpen(true)}
+        onOpenGoals={() => setGoalsOpen(true)}
+        onOpenOrgChart={() => setOrgChartOpen(true)}
+      />
+
       {/* GoBoost WhatsApp Chat Panel — Iteration 2.B.1.
           Fixed right-side overlay; binds to currently-selected agent. */}
-      <WhatsAppPanel selectedAgentId={selectedAgent} selectedAgentName={selectedAgentName} />
+      <WhatsAppPanel
+        selectedAgentId={selectedAgent}
+        selectedAgentName={selectedAgentName}
+        activeScope={activeScope}
+        onPinIssue={pinIssueAsBookmark}
+      />
+
+      {/* Project add / create / edit modals. */}
+      {addMenuOpen ? (
+        <ProjectAddModal
+          availableProjects={addableProjects}
+          onClose={() => setAddMenuOpen(false)}
+          onAddProject={(projectId) => {
+            setAddMenuOpen(false);
+            onAddProject(projectId);
+          }}
+          onCreateNew={() => {
+            setAddMenuOpen(false);
+            setCreatingProject(true);
+          }}
+        />
+      ) : null}
+      {creatingProject ? (
+        <ProjectCreateModal
+          onClose={() => setCreatingProject(false)}
+          onCreated={(project) => {
+            setCreatingProject(false);
+            onProjectsChanged(project.id);
+          }}
+        />
+      ) : null}
+      {editingProjectId ? (
+        <ProjectEditModal
+          projectId={editingProjectId}
+          onClose={() => setEditingProjectId(null)}
+          onChanged={() => onProjectsChanged()}
+          onArchived={(projectId) => {
+            setEditingProjectId(null);
+            onRemoveBookmark(projectBookmarkId(projectId));
+            onProjectsChanged();
+          }}
+        />
+      ) : null}
+      {goalsOpen ? (
+        <GoalsModal onClose={() => setGoalsOpen(false)} />
+      ) : null}
+      {orgChartOpen ? (
+        <OrgChartModal
+          onClose={() => setOrgChartOpen(false)}
+          onSelectAgent={(uuid, numericId) => {
+            setOrgChartOpen(false);
+            // Mirror the canvas-click flow so the office, chat, and
+            // forest all re-home onto this agent (same MessageEvent
+            // shape used by handleClick).
+            window.dispatchEvent(
+              new MessageEvent('message', {
+                data: { type: 'agentSelected', id: numericId },
+              }),
+            );
+            // Phase 3.E cross-link: opening the org chart and clicking
+            // a node lands the operator straight into that agent's
+            // management modal.
+            setAgentMgmtUuid(uuid);
+          }}
+          onAskCeo={(ceoUuid, ceoName) => {
+            // Reuse AssignTaskModal for the "Ask CEO" issue draft —
+            // same full-featured composer that the ➕ agent toolbar
+            // button uses (priority, goal, project, etc.). NewAgentDialog
+            // closes itself; OrgChartModal stays behind so the operator
+            // returns to the chart after submitting.
+            setAssignTaskUuid(ceoUuid);
+            setAssignTaskPrefill({
+              title: 'יצירת סוכן חדש',
+              description:
+                '(תאר כאן איזה סוכן אתה רוצה — תפקיד, כישורים, כלים שדרושים)',
+              contextHint: `המשימה תוקצה ל-${ceoName ?? 'CEO'} שיחליט מי לגייס ואיך לאתחל את הסוכן.`,
+            });
+          }}
+        />
+      ) : null}
+      {agentMgmtUuid ? (
+        <AgentManagementModal
+          agentUuid={agentMgmtUuid}
+          onClose={() => setAgentMgmtUuid(null)}
+        />
+      ) : null}
+      {assignTaskUuid ? (
+        <AssignTaskModal
+          agentUuid={assignTaskUuid}
+          initialTitle={assignTaskPrefill?.title}
+          initialDescription={assignTaskPrefill?.description}
+          contextHint={assignTaskPrefill?.contextHint}
+          onClose={() => {
+            setAssignTaskUuid(null);
+            setAssignTaskPrefill(null);
+          }}
+        />
+      ) : null}
 
       {!isDebugMode ? (
         <>
@@ -319,6 +688,18 @@ function App() {
             panRef={editor.panRef}
             onCloseAgent={handleCloseAgent}
             alwaysShowOverlay={alwaysShowOverlay}
+          />
+          {/* Agent action toolbar — floats above the selected agent's
+              ToolOverlay. Distinct layer so the metadata strip below
+              stays untouched. */}
+          <AgentActionToolbar
+            officeState={officeState}
+            containerRef={containerRef}
+            zoom={editor.zoom}
+            panRef={editor.panRef}
+            onOpenSettings={(uuid) => setAgentMgmtUuid(uuid)}
+            onAssignTask={(uuid) => setAssignTaskUuid(uuid)}
+            onPinIssue={pinIssueAsBookmark}
           />
         </>
       ) : (

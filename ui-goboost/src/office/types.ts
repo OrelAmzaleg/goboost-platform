@@ -196,4 +196,11 @@ export interface Character {
   inputTokens: number;
   /** Cumulative output tokens consumed */
   outputTokens: number;
+  /**
+   * Active text speech bubble — the agent "saying" what they're doing
+   * right now (driven by chat-runtime events via agentSpeechBridge).
+   * Independent of `bubbleType` above, which is the existing icon-only
+   * bubble layer; the two can coexist.
+   */
+  speechBubble: import('./engine/agentSpeech.js').SpeechBubble | null;
 }

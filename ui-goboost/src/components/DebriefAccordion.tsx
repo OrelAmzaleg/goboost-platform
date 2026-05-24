@@ -26,13 +26,30 @@ export interface DebriefAccordionProps {
   comments: PaperclipComment[];
   size: (base: number) => number;
   formatTime: (iso: string) => string;
-  agentName: string;
+  /**
+   * Per-comment author resolver. Each debrief row shows the agent who
+   * actually emitted it, so a multi-agent thread doesn't collapse onto
+   * one name. Falls back to a generic "סוכן" when authorship can't be
+   * determined.
+   */
+  resolveAgentName: (comment: PaperclipComment) => string;
 }
 
 // Canonical phrases produced by the heartbeat self-echo / disposition
 // guards. Matched case-insensitively against the comment body.
-// Keep this list tight — broaden only when we observe a new pattern.
+//
+// Two language families:
+//   • English — the original system prompts.
+//   • Hebrew  — when the agent system prompt is in Hebrew the same
+//     guards surface in Hebrew. Patterns observed in the wild include
+//     "התגובה האחרונה (xxx) ... שאני עצמי פרסמתי בהיהבטיט הקודם",
+//     "אין קלט משתמש חדש", "אין פעולה לבצע".
+//
+// Keep this list tight — broaden only when we observe a new pattern in
+// production data. False positives hide real dialogue under "סיכומי
+// הסוכן" instead of in the chat flow.
 const DEBRIEF_PATTERNS = [
+  // English self-echo / disposition / acknowledge-only
   /\bself[- ]echo\b/i,
   /^\s*disposition\s*:/i,
   /^\s*summary\s*:\s*wake\b/i,
@@ -41,6 +58,14 @@ const DEBRIEF_PATTERNS = [
   /\bno further action\b/i,
   /\bno new (human|user) input\b/i,
   /\bno new user comment to act on\b/i,
+  // Hebrew variants
+  /^\s*התגובה האחרונה\s*\(/,
+  /שאני עצמי פרסמתי/,
+  /אין קלט משתמש חדש/,
+  /אין פעולה לבצע/,
+  /זוהי תגובת ההיהבטיט/,
+  /ההד של ההודעה שלי/,
+  /ללא תגובה כפולה/,
 ];
 
 /**
@@ -58,7 +83,7 @@ export function DebriefAccordion({
   comments,
   size,
   formatTime,
-  agentName,
+  resolveAgentName,
 }: DebriefAccordionProps) {
   const [open, setOpen] = useState(false);
 
@@ -191,7 +216,7 @@ export function DebriefAccordion({
                   alignItems: 'baseline',
                 }}
               >
-                <span>{agentName}</span>
+                <span>{resolveAgentName(c)}</span>
                 <span>·</span>
                 <span>{formatTime(c.createdAt)}</span>
                 {c.createdByRunId ? (

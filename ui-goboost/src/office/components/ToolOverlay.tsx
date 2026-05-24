@@ -116,6 +116,14 @@ export function ToolOverlay({
         const isHovered = hoveredId === id;
         const isSub = ch.isSubagent;
 
+        // GoBoost (Session 4 follow-up): main agents get a richer
+        // identity + actions cluster from `AgentActionToolbar` (renders
+        // on hover and on selection). Suppress the legacy ToolOverlay
+        // for them to avoid two stacked containers showing the same
+        // info. Sub-agents keep this overlay — it carries the fuel
+        // gauge + permission-wait label that the toolbar doesn't show.
+        if (!isSub) return null;
+
         // Only show for hovered or selected agents (unless always-show is on)
         if (!alwaysShowOverlay && !isSelected && !isHovered) return null;
 

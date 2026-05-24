@@ -2,17 +2,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   createIssue,
-  fetchAgentIssues,
+  fetchAgentById,
   fetchCompanyAgents,
+  fetchHeartbeatRun,
   fetchIssueApprovals,
   fetchIssueAttachments,
   fetchIssueComments,
   fetchIssueThreadInteractions,
   getAgentName,
+  numericIdForAgentUuid,
   postIssueComment,
   subscribeActivity,
   subscribeHeartbeatEvents,
   updateIssueAssignee,
+  uploadIssueAttachment,
   uuidForNumericAgentId,
   type PaperclipAgentSummary,
   type PaperclipApproval,
@@ -20,8 +23,23 @@ import {
   type PaperclipComment,
   type PaperclipHeartbeatEvent,
   type PaperclipIssue,
+  type PaperclipIssueWorkMode,
   type PaperclipThreadInteraction,
 } from '../paperclipApi.js';
+import type { BookmarkScope } from '../bookmarks.js';
+import {
+  buildAgentForest,
+  findNodeInForest,
+  type IssueTreeNode,
+} from '../paperclipTree.js';
+import { validateAttachmentSize } from './attachmentHelpers.js';
+import { statusColor } from './issuePresentation.js';
+import { IssueTreePicker } from './IssueTreePicker.js';
+import {
+  newLocalFileId,
+  PendingFileChip,
+  type PendingFile,
+} from './PendingFileChip.js';
 import { ApprovalCard } from './ApprovalCard.js';
 import { AttachmentChip } from './AttachmentChip.js';
 import { DebriefAccordion, isDebriefComment } from './DebriefAccordion.js';
@@ -54,6 +72,10 @@ export interface WhatsAppPanelProps {
   selectedAgentId: number | null;
   /** Display name of the selected agent (from useExtensionMessages). */
   selectedAgentName?: string | null;
+  /** Active project-bookmark scope — filters the agent's issue forest. */
+  activeScope: BookmarkScope;
+  /** Pin the current chat issue as a new issue-scope bookmark. */
+  onPinIssue: (issue: PaperclipIssue) => void;
 }
 
 // ── User preferences (persisted in localStorage) ────────────────────────────
@@ -110,27 +132,62 @@ interface BubbleAuthor {
   name: string;
 }
 
-function authorFor(comment: PaperclipComment, fallbackAgentName: string): BubbleAuthor {
-  // 1. Explicit system notice — the strongest signal. Render rich card.
+function authorFor(
+  comment: PaperclipComment,
+  /**
+   * True when a fetched heartbeat run reported it *produced* this
+   * comment (via `issueCommentSatisfiedByCommentId`). Definitive: the
+   * comment is agent content regardless of what `authorType` says.
+   */
+  isAgentProduced: boolean,
+  /**
+   * The name to render on an agent bubble. The CALLER resolves this
+   * per-comment (via `authorAgentId` or a `createdByRunId` lookup) so a
+   * multi-agent thread shows each bubble attributed to its actual author
+   * instead of all collapsing onto the chat-selected agent.
+   */
+  resolvedAgentName: string,
+): BubbleAuthor {
+  // 1. Explicit system notice — strongest signal. Render rich card.
   if (
     comment.authorType === 'system' &&
     comment.presentation?.kind === 'system_notice'
   ) {
     return { type: 'system_notice', name: 'מערכת' };
   }
-  // 2. Agent-authored: in Paperclip's local_trusted mode the local-board
-  //    user is recorded as the actor even for content the agent produced
-  //    during a heartbeat run. The most reliable signal that this is
-  //    *agent content* is `createdByRunId` — runs only exist as part of
-  //    an agent's execution loop. authorAgentId is also a positive signal.
-  if (comment.authorAgentId || comment.createdByRunId) {
-    return { type: 'agent', name: fallbackAgentName };
+  // 2. Definitive agent signals — `authorAgentId` set, a fetched run
+  //    confirmed this comment as its output, or `authorType === 'agent'`.
+  //    These override everything else.
+  if (
+    comment.authorAgentId ||
+    isAgentProduced ||
+    comment.authorType === 'agent'
+  ) {
+    return { type: 'agent', name: resolvedAgentName };
   }
-  // 3. Human-authored.
+  // 3. Real user dialogue with NO run association — definitely a human
+  //    typed it (no heartbeat ever touched this comment).
+  if (
+    (comment.authorUserId || comment.authorType === 'user') &&
+    !comment.createdByRunId
+  ) {
+    return { type: 'human', name: 'אני' };
+  }
+  // 4. Has a run id — default to agent. In local_trusted mode
+  //    agent-produced replies arrive as `authorType: 'user'` +
+  //    `createdByRunId` because no agent JWT is injected. Treating these
+  //    as agent by default matches the original good behavior; the rare
+  //    real-user wake-trigger case is corrected when the
+  //    `issueCommentSatisfiedByCommentId` back-fill confirms a different
+  //    comment was the run's actual output.
+  if (comment.createdByRunId) {
+    return { type: 'agent', name: resolvedAgentName };
+  }
+  // 5. Fallback user.
   if (comment.authorUserId || comment.authorType === 'user') {
     return { type: 'human', name: 'אני' };
   }
-  // 4. Legacy system row (no presentation contract). Compact pill.
+  // 6. Legacy system row (no presentation contract). Compact pill.
   return { type: 'system_legacy', name: 'מערכת' };
 }
 
@@ -143,53 +200,8 @@ function formatTime(iso: string): string {
   }
 }
 
-// Status color for the issue picker dot. Paperclip statuses:
-//   backlog/todo → cool gray (queued)
-//   in_progress  → blue
-//   in_review    → amber (waiting for sign-off)
-//   blocked      → orange (impeded)
-//   done         → green
-//   cancelled    → red/muted
-function statusColor(status: string): string {
-  switch (status) {
-    case 'in_progress':
-      return '#3b82f6';
-    case 'in_review':
-      return '#f59e0b';
-    case 'blocked':
-      return '#fb923c';
-    case 'done':
-      return '#22c55e';
-    case 'cancelled':
-      return '#dc2626';
-    case 'todo':
-    case 'backlog':
-    default:
-      return '#94a3b8';
-  }
-}
-
-// Hebrew label for the status (compact, for the picker rows).
-function statusLabel(status: string): string {
-  switch (status) {
-    case 'backlog':
-      return 'תור';
-    case 'todo':
-      return 'לעשות';
-    case 'in_progress':
-      return 'בעבודה';
-    case 'in_review':
-      return 'בבדיקה';
-    case 'blocked':
-      return 'חסום';
-    case 'done':
-      return 'הושלם';
-    case 'cancelled':
-      return 'בוטל';
-    default:
-      return status;
-  }
-}
+// `statusColor` / `statusLabel` now live in ./issuePresentation.ts —
+// shared with TasksPanel and the issue-tree picker.
 
 // Header icon button — small, minimal, white-on-purple-gradient.
 function IconButton({
@@ -197,12 +209,17 @@ function IconButton({
   onClick,
   children,
   disabled,
+  active,
 }: {
   title: string;
   onClick: () => void;
   children: React.ReactNode;
   disabled?: boolean;
+  /** When true, render in a depressed/highlighted state — useful for toggles. */
+  active?: boolean;
 }) {
+  const restingBg = active ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.12)';
+  const hoverBg = active ? 'rgba(255,255,255,0.32)' : 'rgba(255,255,255,0.22)';
   return (
     <button
       type="button"
@@ -216,7 +233,7 @@ function IconButton({
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'rgba(255,255,255,0.12)',
+        background: restingBg,
         color: '#fff',
         border: 'none',
         borderRadius: 7,
@@ -229,10 +246,10 @@ function IconButton({
         transition: 'background 0.15s',
       }}
       onMouseEnter={(e) => {
-        if (!disabled) (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.22)';
+        if (!disabled) (e.currentTarget as HTMLButtonElement).style.background = hoverBg;
       }}
       onMouseLeave={(e) => {
-        (e.currentTarget as HTMLButtonElement).style.background = 'rgba(255,255,255,0.12)';
+        (e.currentTarget as HTMLButtonElement).style.background = restingBg;
       }}
     >
       {children}
@@ -242,10 +259,28 @@ function IconButton({
 
 // ── Main component ──────────────────────────────────────────────────────────
 
-export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPanelProps) {
-  // Chat state
+export function WhatsAppPanel({
+  selectedAgentId,
+  selectedAgentName,
+  activeScope,
+  onPinIssue,
+}: WhatsAppPanelProps) {
+  // Chat state.
+  //
+  // The active `issue` is the single source of truth for what the chat
+  // shows. The focused agent (`selectedAgentId` prop) only selects WHICH
+  // forest of issue-trees to display — `forest`. Navigating to an issue
+  // owned by a different agent re-homes the office (see `onSelectNode`),
+  // so the focused agent always equals the perspective.
   const [issue, setIssue] = useState<PaperclipIssue | null>(null);
-  const [allIssues, setAllIssues] = useState<PaperclipIssue[]>([]);
+  const [forest, setForest] = useState<IssueTreeNode[]>([]);
+  const [forestLoading, setForestLoading] = useState(false);
+  // When navigating cross-agent, the office re-homes (selectedAgentId
+  // changes) and the forest rebuilds. This holds the issue id to select
+  // once that rebuild lands, instead of the default lit-issue pick.
+  const [pendingIssueTarget, setPendingIssueTarget] = useState<string | null>(
+    null,
+  );
   const [comments, setComments] = useState<PaperclipComment[]>([]);
   // 2.B.4 / 2.B.7 — interactions + attachments per issue.
   const [interactions, setInteractions] = useState<PaperclipThreadInteraction[]>([]);
@@ -273,6 +308,19 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   // assignee. The previous assignee stops getting wake-ups on this Issue.
   const [companyAgents, setCompanyAgents] = useState<PaperclipAgentSummary[]>([]);
   const [assigneePickerOpen, setAssigneePickerOpen] = useState(false);
+  // Pending reassignment — the picker no longer fires `updateIssueAssignee`
+  // on selection. Instead, it stages the target here; the actual PATCH
+  // rides with the NEXT comment the operator sends (the message is the
+  // context for the handoff). Two-stage confirm:
+  //   • `pendingReassignAgentId` set, `pendingReassignConfirmed` false →
+  //     the user picked a different agent; the banner asks for approval.
+  //   • both set → the reassignment is armed and will be sent with the
+  //     next message.
+  const [pendingReassignAgentId, setPendingReassignAgentId] = useState<
+    string | null
+  >(null);
+  const [pendingReassignConfirmed, setPendingReassignConfirmed] =
+    useState(false);
   const [reassigning, setReassigning] = useState(false);
   const assigneePickerWrapRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -307,28 +355,48 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
       cancelled = true;
     };
   }, [issue, companyAgents.length]);
+  // `agentPaused` state declared here (early) so the JSX header can
+  // reference it; the effect that populates it lives AFTER agentUuid
+  // is declared (lower in the file) to avoid a TDZ ReferenceError.
+  const [agentPaused, setAgentPaused] = useState(false);
+
+  // (Goals fetch removed — the header chip that consumed it was
+  // dropped in Session 1 follow-up; the standalone GoalsModal manages
+  // its own fetching.)
+  // Picking an agent STAGES the reassignment instead of firing it
+  // immediately. The user then approves the staged change, and the
+  // actual PATCH rides with the next message they send.
   const onChangeAssignee = useCallback(
-    async (next: PaperclipAgentSummary) => {
-      if (!issue || reassigning) return;
+    (next: PaperclipAgentSummary) => {
+      if (!issue) return;
+      setAssigneePickerOpen(false);
+      // Picking the current assignee clears any pending stage.
       if (next.id === issue.assigneeAgentId) {
-        setAssigneePickerOpen(false);
+        setPendingReassignAgentId(null);
+        setPendingReassignConfirmed(false);
         return;
       }
-      setReassigning(true);
-      const updated = await updateIssueAssignee(issue.id, next.id);
-      setReassigning(false);
-      setAssigneePickerOpen(false);
-      if (updated) {
-        setIssue(updated);
-        setAllIssues((prev) =>
-          prev.map((it) => (it.id === updated.id ? updated : it)),
-        );
-      } else {
-        setErrorText('שינוי הסוכן נכשל. נסה שוב.');
-      }
+      // Different agent — stage it; await operator approval.
+      setPendingReassignAgentId(next.id);
+      setPendingReassignConfirmed(false);
     },
-    [issue, reassigning],
+    [issue],
   );
+
+  // Cancel any staged reassignment.
+  const cancelPendingReassign = useCallback(() => {
+    setPendingReassignAgentId(null);
+    setPendingReassignConfirmed(false);
+  }, []);
+  const confirmPendingReassign = useCallback(() => {
+    setPendingReassignConfirmed(true);
+  }, []);
+  // Clear the staged reassignment whenever the active issue changes —
+  // the staged change was scoped to that conversation.
+  useEffect(() => {
+    setPendingReassignAgentId(null);
+    setPendingReassignConfirmed(false);
+  }, [issue?.id]);
 
   // UX preferences (persisted)
   const [collapsed, setCollapsed] = useState(() => readBoolPref(LS_COLLAPSED, false));
@@ -358,8 +426,9 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   // forward-reference `agentUuid` in this block, so the actual
   // subscribe useEffect and the timeline useMemo live AFTER agentUuid.
 
-  // Session picker (2.B.2.B) — dropdown of all issues assigned to the
-  // current agent. Closes on outside-click or when an item is selected.
+  // Issue-tree picker — dropdown showing the focused agent's issue
+  // forest. Closes on outside-click or when a node is selected.
+  // The `onSelectNode` handler is declared lower (it needs `agentUuid`).
   const [pickerOpen, setPickerOpen] = useState(false);
   const pickerWrapRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -373,10 +442,6 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [pickerOpen]);
-  const onSelectIssue = useCallback((next: PaperclipIssue) => {
-    setIssue(next);
-    setPickerOpen(false);
-  }, []);
 
   // "+ שיחה חדשה" — transparent flow per user spec (2.B.2.E #1): visible
   // only when an agent is selected; click immediately creates a fresh
@@ -429,6 +494,89 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     [selectedAgentId],
   );
 
+  // Track the selected agent's paused state so the header can render
+  // a "מושהה" pill. Placed AFTER `agentUuid` is declared (TDZ-safe:
+  // the deps array `[agentUuid]` runs synchronously during render and
+  // would throw if the binding hadn't been initialized yet).
+  useEffect(() => {
+    if (!agentUuid) {
+      setAgentPaused(false);
+      return;
+    }
+    let cancelled = false;
+    const load = () => {
+      void fetchAgentById(agentUuid).then((a) => {
+        if (!cancelled) setAgentPaused(a?.status === 'paused');
+      });
+    };
+    load();
+    const unsub = subscribeActivity((payload) => {
+      const et = String(payload.entityType ?? '');
+      const eid = String(payload.entityId ?? '');
+      if (et !== 'agent' || eid !== agentUuid) return;
+      if (!cancelled) load();
+    });
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  }, [agentUuid]);
+
+  // Rebuild the issue forest for the focused agent, scoped by the active
+  // project bookmark. Used by the load effect, the live-activity handler,
+  // and after creating a new issue.
+  const refreshForest = useCallback(async () => {
+    if (!agentUuid) {
+      setForest([]);
+      return;
+    }
+    setForestLoading(true);
+    const next = await buildAgentForest(agentUuid, activeScope);
+    setForest(next);
+    setForestLoading(false);
+  }, [agentUuid, activeScope]);
+
+  // Navigate to an issue node. Two paths:
+  //   • the node is owned by the focused agent (or unassigned) → just
+  //     set it as the active issue.
+  //   • the node is owned by a DIFFERENT agent → re-home the visual
+  //     office to that owner (dispatch `agentSelected`), and stash the
+  //     issue id in `pendingIssueTarget` so the forest rebuild that
+  //     follows selects it instead of the default.
+  const onSelectNode = useCallback(
+    (target: PaperclipIssue) => {
+      setPickerOpen(false);
+      const ownerUuid = target.assigneeAgentId;
+      if (ownerUuid && ownerUuid !== agentUuid) {
+        const ownerNumericId = numericIdForAgentUuid(ownerUuid);
+        if (ownerNumericId != null) {
+          setPendingIssueTarget(target.id);
+          // Re-home the office — flows back as a new `selectedAgentId`.
+          window.dispatchEvent(
+            new MessageEvent('message', {
+              data: { type: 'agentSelected', id: ownerNumericId },
+            }),
+          );
+          return;
+        }
+      }
+      // Same-owner or unassigned — open in place.
+      setIssue(target);
+    },
+    [agentUuid],
+  );
+
+  // Total node count across the forest — shown on the picker chip.
+  const forestNodeCount = useMemo(() => {
+    let n = 0;
+    const walk = (node: IssueTreeNode) => {
+      n += 1;
+      for (const c of node.children) walk(c);
+    };
+    for (const root of forest) walk(root);
+    return n;
+  }, [forest]);
+
   // "+ שיחה חדשה" — declared HERE because it depends on agentUuid/agentName.
   //
   // UX (per design discussion 2026-05): clicking the button does NOT create
@@ -449,12 +597,26 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   // editing in Paperclip's classic UI.
   const [newStatus, setNewStatus] = useState<string>('todo');
   const [newPriority, setNewPriority] = useState<string>('medium');
+  // Issue work mode — Paperclip's "standard" vs "planning" distinction.
+  // Default standard so the form match's backend's default; toggling to
+  // planning sends an explicit workMode in the create payload.
+  const [newWorkMode, setNewWorkMode] = useState<PaperclipIssueWorkMode>('standard');
+  // Files staged for upload as part of the new issue. Each entry is a
+  // PendingFile (local id + file + uploading/error flags). On submit we
+  // create the issue first, then upload each file scoped to it.
+  const [newFiles, setNewFiles] = useState<PendingFile[]>([]);
+  // Files staged in the composer for the *next* comment. Sent after the
+  // comment POST returns so we can bind each attachment to its
+  // issueCommentId — Paperclip then renders them inline under the bubble.
+  const [composerFiles, setComposerFiles] = useState<PendingFile[]>([]);
   const closeNewForm = useCallback(() => {
     setNewFormOpen(false);
     setNewTitle('');
     setNewDescription('');
     setNewStatus('todo');
     setNewPriority('medium');
+    setNewWorkMode('standard');
+    setNewFiles([]);
   }, []);
   const onOpenNewForm = useCallback(() => {
     setNewFormOpen(true);
@@ -462,26 +624,94 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     setNewDescription('');
     setNewStatus('todo');
     setNewPriority('medium');
+    setNewWorkMode('standard');
+    setNewFiles([]);
   }, []);
+
+  // Generic file-staging helper used by both the new-conversation form
+  // and the composer drop zones. Runs client-side size validation and
+  // surfaces a per-chip error rather than blocking the whole add.
+  const stageFiles = useCallback(
+    (
+      setter: React.Dispatch<React.SetStateAction<PendingFile[]>>,
+      files: FileList | File[] | null | undefined,
+    ) => {
+      if (!files) return;
+      const arr = Array.from(files);
+      if (arr.length === 0) return;
+      const staged: PendingFile[] = arr.map((file) => {
+        const check = validateAttachmentSize(file);
+        return {
+          localId: newLocalFileId(),
+          file,
+          error: check.ok ? null : check.error ?? 'קובץ לא תקין',
+          uploading: false,
+        };
+      });
+      setter((prev) => [...prev, ...staged]);
+    },
+    [],
+  );
+
   const onSubmitNewConversation = useCallback(async () => {
     if (!agentUuid || creatingConversation) return;
     const trimmedTitle = newTitle.trim();
     if (!trimmedTitle) return;
+    // Block submit if any staged file has a client-side error.
+    if (newFiles.some((f) => f.error != null)) return;
     setCreatingConversation(true);
     try {
-      const newIssue = await createIssue({
+      const created = await createIssue({
         title: trimmedTitle,
         description: newDescription.trim(),
         assigneeAgentId: agentUuid,
         status: newStatus,
         priority: newPriority,
+        // Only send workMode when the user picked planning; otherwise
+        // let the server fall back to its own default ("standard").
+        ...(newWorkMode !== 'standard' ? { workMode: newWorkMode } : {}),
       });
-      if (newIssue) {
-        setAllIssues((prev) => [newIssue, ...prev]);
-        setIssue(newIssue);
-        setPickerOpen(false);
-        closeNewForm();
+      if (!created) return;
+
+      // Upload staged files in parallel. Failures don't abort the issue
+      // creation — the issue is already on the server. We mark individual
+      // chips with errors so the user can retry from there if they care.
+      if (newFiles.length > 0) {
+        setNewFiles((prev) =>
+          prev.map((f) => ({ ...f, uploading: f.error == null })),
+        );
+        const results = await Promise.all(
+          newFiles.map(async (pf) => {
+            if (pf.error != null) return { pf, ok: false } as const;
+            const att = await uploadIssueAttachment(created.id, pf.file);
+            return { pf, ok: att != null } as const;
+          }),
+        );
+        const failed = results.filter((r) => !r.ok);
+        if (failed.length > 0) {
+          // Persist the form open so the user sees the errors.
+          setNewFiles((prev) =>
+            prev.map((f) => {
+              const failure = results.find((r) => r.pf.localId === f.localId);
+              if (failure && !failure.ok && f.error == null) {
+                return { ...f, uploading: false, error: 'העלאה נכשלה. נסה שוב.' };
+              }
+              return { ...f, uploading: false };
+            }),
+          );
+          // Still switch to the new issue — the dialogue can continue
+          // while the user decides what to do with the failed uploads.
+          setIssue(created);
+          void refreshForest();
+          return;
+        }
       }
+
+      setIssue(created);
+      setPickerOpen(false);
+      closeNewForm();
+      // Pull the new root issue into the forest.
+      void refreshForest();
     } finally {
       setCreatingConversation(false);
     }
@@ -491,8 +721,11 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     newDescription,
     newStatus,
     newPriority,
+    newWorkMode,
+    newFiles,
     creatingConversation,
     closeNewForm,
+    refreshForest,
   ]);
 
   // Subscribe to heartbeat events whenever there's an agent in focus.
@@ -578,6 +811,141 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   // Aggregate live heartbeat events into LiveRun objects, scoped to the
   // active agent (the subscription is already filtered at write-time).
   const liveRuns = useMemo(() => aggregateRuns(heartbeatEvents), [heartbeatEvents]);
+
+  // Multi-agent attribution: build `runId → agentUuid` from THREE signals
+  // (in order of cost / authority):
+  //   1. Live heartbeat events — synchronous, free, every event carries
+  //      `agentId` per `runId`.
+  //   2. Same-comment pairings — any comment that has both
+  //      `authorAgentId` AND `createdByRunId` pins the run to its agent.
+  //   3. `GET /heartbeat-runs/:runId` — async back-fill for the rest.
+  //      Required in local_trusted mode where substantive agent comments
+  //      arrive with `authorAgentId: null` (no JWT injected) and their
+  //      run id never appears with an explicit agent in #1 or #2.
+  //
+  // Without #3, the chat had to fall back to the generic "סוכן" label.
+  // With it, every comment that came from a heartbeat run gets the real
+  // author's name — matching Paperclip's dashboard.
+  const [runAgentMap, setRunAgentMap] = useState<Map<string, string>>(
+    () => new Map(),
+  );
+  // commentId → agentUuid for comments where a fetched run reports it
+  // *produced* this comment (via `issueCommentSatisfiedByCommentId`).
+  // Critical for classification: a comment with `authorType: 'user'`
+  // could be either a real user-typed wake trigger OR an agent-emitted
+  // reply that Paperclip misattributed due to a missing JWT — only this
+  // map distinguishes them.
+  const [commentAgentById, setCommentAgentById] = useState<
+    Map<string, string>
+  >(() => new Map());
+  // Effect A: seed from heartbeat events + same-comment pairings (sync).
+  useEffect(() => {
+    setRunAgentMap((prev) => {
+      const next = new Map(prev);
+      let changed = false;
+      for (const ev of heartbeatEvents) {
+        if (ev.runId && ev.agentId && !next.has(ev.runId)) {
+          next.set(ev.runId, ev.agentId);
+          changed = true;
+        }
+      }
+      for (const c of comments) {
+        if (
+          c.createdByRunId &&
+          c.authorAgentId &&
+          !next.has(c.createdByRunId)
+        ) {
+          next.set(c.createdByRunId, c.authorAgentId);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [heartbeatEvents, comments]);
+  // Effect B: back-fill anything still missing via the API. One call
+  // per unknown runId, in parallel; only fires for genuinely-new ids.
+  //
+  // NOTE: writes are idempotent (Map.set), and a stale write from a
+  // previous render is still correct data — so we deliberately do NOT
+  // use a `cancelled` flag here. If the effect re-runs while a fetch is
+  // in flight, the cleanup must NOT abort the .then(): doing so would
+  // also skip the `inFlightRunsRef.delete()` cleanup, permanently
+  // leaking those runIds and stranding their comments on the "סוכן"
+  // fallback. (This was the original bug — every WebSocket heartbeat
+  // event mutated `runAgentMap`, re-firing this effect and cancelling
+  // the back-fill fetches scheduled on mount.)
+  const inFlightRunsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const unknown: string[] = [];
+    const seen = new Set<string>();
+    for (const c of comments) {
+      const rid = c.createdByRunId;
+      if (!rid) continue;
+      if (seen.has(rid)) continue;
+      seen.add(rid);
+      if (runAgentMap.has(rid) || inFlightRunsRef.current.has(rid)) continue;
+      unknown.push(rid);
+    }
+    if (unknown.length === 0) return;
+    for (const rid of unknown) inFlightRunsRef.current.add(rid);
+    void Promise.all(unknown.map((rid) => fetchHeartbeatRun(rid))).then(
+      (results) => {
+        // Always free the inFlight slots first — even on partial failure.
+        for (const rid of unknown) inFlightRunsRef.current.delete(rid);
+        const runAdditions: [string, string][] = [];
+        const commentAdditions: [string, string][] = [];
+        for (const run of results) {
+          if (!run) continue;
+          runAdditions.push([run.id, run.agentId]);
+          // Definitive attribution: the run reports which comment it
+          // produced. That comment is by `run.agentId` regardless of
+          // what `authorType` says.
+          if (run.issueCommentSatisfiedByCommentId) {
+            commentAdditions.push([
+              run.issueCommentSatisfiedByCommentId,
+              run.agentId,
+            ]);
+          }
+        }
+        if (runAdditions.length > 0) {
+          setRunAgentMap((prev) => {
+            const next = new Map(prev);
+            for (const [k, v] of runAdditions) next.set(k, v);
+            return next;
+          });
+        }
+        if (commentAdditions.length > 0) {
+          setCommentAgentById((prev) => {
+            const next = new Map(prev);
+            for (const [k, v] of commentAdditions) next.set(k, v);
+            return next;
+          });
+        }
+      },
+    );
+  }, [comments, runAgentMap]);
+
+  // Resolve the display name for a single comment's author. Order:
+  //   • `authorAgentId` set → look it up.
+  //   • else, infer from `createdByRunId` via the map above.
+  //   • else, a generic "סוכן" rather than faking the chat agent.
+  const resolveAgentName = useCallback(
+    (c: PaperclipComment): string => {
+      // Most authoritative: a fetched run reported it produced this
+      // comment — that run's agentId IS the author.
+      const direct = commentAgentById.get(c.id);
+      if (direct) return getAgentName(direct) ?? 'סוכן';
+      if (c.authorAgentId) {
+        return getAgentName(c.authorAgentId) ?? 'סוכן';
+      }
+      if (c.createdByRunId) {
+        const inferred = runAgentMap.get(c.createdByRunId);
+        if (inferred) return getAgentName(inferred) ?? 'סוכן';
+      }
+      return 'סוכן';
+    },
+    [runAgentMap, commentAgentById],
+  );
 
   // Comments that look like heartbeat self-debriefs (self-echo guards,
   // disposition notes, "exiting cleanly" reports). They're routed to the
@@ -670,36 +1038,98 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
     return items.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
   }, [comments, interactions, approvals, ticks, attachments, liveRuns, issue]);
 
-  // Reset state when a different agent is selected
+  // Reset state when a different agent is selected. NOTE: `issue` is
+  // deliberately NOT cleared here — when a cross-agent navigation
+  // re-homes the office, we want the chat to hold its position until
+  // the new forest resolves and selects the pending target. Effect A
+  // handles the final issue selection.
   useEffect(() => {
-    setIssue(null);
-    setAllIssues([]);
     setComments([]);
     setDraft('');
     setErrorText(null);
   }, [selectedAgentId]);
 
-  // Effect A: when the selected agent changes, fetch their issue list and
-  // auto-select the most-recently-updated one. Comments load is delegated
-  // to Effect B so manual issue switching (via the session picker) shares
-  // the same code path as initial auto-select.
+  // Effect A: when the focused agent OR the active project scope changes,
+  // rebuild the issue FOREST and choose a default active issue.
+  //
+  // Default-issue selection order:
+  //   1. `pendingIssueTarget` — set by a cross-agent navigation; if the
+  //      issue is present in the new forest, select it (and clear the
+  //      pending flag).
+  //   2. the most-recently-updated LIT issue (agent owns it).
+  //   3. the first node in the forest.
+  //   4. null — agent has no issues in scope.
   useEffect(() => {
     if (!agentUuid) {
-      setAllIssues([]);
+      setForest([]);
       setIssue(null);
       return;
     }
     let cancelled = false;
+    setForestLoading(true);
     (async () => {
-      const issues = await fetchAgentIssues(agentUuid);
+      const next = await buildAgentForest(agentUuid, activeScope);
       if (cancelled) return;
-      setAllIssues(issues);
-      setIssue(issues[0] ?? null);
+      setForest(next);
+      setForestLoading(false);
+
+      // 1. Pending cross-agent target.
+      if (pendingIssueTarget) {
+        const hit = findNodeInForest(next, pendingIssueTarget);
+        setPendingIssueTarget(null);
+        if (hit) {
+          setIssue(hit.issue);
+          return;
+        }
+      }
+      // 2/3. Most-recent lit issue, else first node.
+      const flat = next.flatMap(function collect(n): IssueTreeNode[] {
+        return [n, ...n.children.flatMap(collect)];
+      });
+      const lit = flat
+        .filter((n) => n.lit)
+        .sort((a, b) => (a.issue.updatedAt < b.issue.updatedAt ? 1 : -1));
+      const pick = lit[0] ?? flat[0] ?? null;
+      setIssue(pick ? pick.issue : null);
     })();
     return () => {
       cancelled = true;
     };
-  }, [agentUuid]);
+    // `pendingIssueTarget` intentionally omitted — it is consumed inside
+    // and re-running on its change would double-fire the forest build.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentUuid, activeScope]);
+
+  // Effect A2: keep the forest live. When an issue is created, re-parented,
+  // moved, or reassigned anywhere in the company, the focused agent's
+  // forest may gain/lose a node or flip a lit/off state. Debounce a
+  // rebuild so a burst of activity (e.g. a decomposition creating several
+  // sub-issues) collapses into one refresh.
+  useEffect(() => {
+    if (!agentUuid) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unsubscribe = subscribeActivity((payload) => {
+      const entityType = String(payload.entityType ?? '');
+      const action = String(payload.action ?? '');
+      if (entityType !== 'issue') return;
+      // Ignore noise that doesn't change tree shape or lit/off state —
+      // comments/attachments/etc. fire constantly and would rebuild the
+      // forest needlessly.
+      if (/comment|attachment|document|interaction|approval/i.test(action)) {
+        return;
+      }
+      // Tree-shape / ownership changes only.
+      if (!/created|parent|moved|assignee/i.test(action)) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        void refreshForest();
+      }, 800);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+    };
+  }, [agentUuid, refreshForest]);
 
   // Effect B: whenever the active issue changes (auto-selected or
   // operator-picked from the session navigator), fetch its comments,
@@ -834,18 +1264,102 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
   const handleSend = useCallback(async () => {
     if (!issue) return;
     const text = draft.trim();
+    // A text message is mandatory. Attachments may ride along with a
+    // message but cannot be sent on their own — sending bare files
+    // would post an empty/placeholder bubble, which the operator
+    // explicitly does not want. Files-only goes through the Tasks
+    // Panel's "מסמכים מצורפים" uploader instead (no comment, no wake).
     if (!text) return;
+    // Block if any staged file has a client-side error (size cap).
+    if (composerFiles.some((f) => f.error != null)) return;
+    const validFiles = composerFiles.filter((f) => f.error == null);
+
     setSending(true);
     setErrorText(null);
     const created = await postIssueComment(issue.id, text);
-    setSending(false);
     if (!created) {
+      setSending(false);
       setErrorText('שליחת ההודעה נכשלה. ודא ש-Paperclip זמין ונסה שוב.');
       return;
     }
     setDraft('');
     setComments((prev) => [...prev, created]);
-  }, [issue, draft]);
+
+    // Upload staged files in parallel, bound to the comment we just
+    // posted. Successful uploads land in `attachments` state — the
+    // existing `byComment` index in the timeline merge then renders
+    // them as inline chips under the new bubble.
+    if (validFiles.length > 0) {
+      setComposerFiles((prev) =>
+        prev.map((f) => (f.error == null ? { ...f, uploading: true } : f)),
+      );
+      const results = await Promise.all(
+        validFiles.map(async (pf) => {
+          const att = await uploadIssueAttachment(issue.id, pf.file, {
+            issueCommentId: created.id,
+          });
+          return { pf, att };
+        }),
+      );
+      const succeededAttachments = results
+        .filter((r) => r.att != null)
+        .map((r) => r.att!) as PaperclipAttachment[];
+      const failedLocalIds = new Set(
+        results.filter((r) => r.att == null).map((r) => r.pf.localId),
+      );
+      const succeededLocalIds = new Set(
+        results.filter((r) => r.att != null).map((r) => r.pf.localId),
+      );
+      if (succeededAttachments.length > 0) {
+        setAttachments((prev) => [...prev, ...succeededAttachments]);
+      }
+      // Drop chips that uploaded; mark this run's failures with an
+      // error so the user can retry. Chips that already carried a
+      // client-side validation error (size cap) are left as-is.
+      setComposerFiles((prev) =>
+        prev.flatMap((f) => {
+          if (succeededLocalIds.has(f.localId)) return [];
+          if (failedLocalIds.has(f.localId)) {
+            return [{ ...f, uploading: false, error: 'העלאה נכשלה. נסה שוב.' }];
+          }
+          return [{ ...f, uploading: false }];
+        }),
+      );
+    }
+
+    // Staged reassignment rides with the just-posted message — that
+    // message is the context the new assignee will read on wake.
+    if (
+      pendingReassignAgentId &&
+      pendingReassignConfirmed &&
+      pendingReassignAgentId !== issue.assigneeAgentId
+    ) {
+      setReassigning(true);
+      const updated = await updateIssueAssignee(
+        issue.id,
+        pendingReassignAgentId,
+      );
+      setReassigning(false);
+      if (updated) {
+        setIssue(updated);
+        setPendingReassignAgentId(null);
+        setPendingReassignConfirmed(false);
+        // Forest's lit/off refreshes via the issue.assignee_changed
+        // activity handler — no manual refresh needed.
+      } else {
+        setErrorText(
+          'ההודעה נשלחה, אבל העברת האחריות נכשלה. אפשר לנסות שוב מהדרופדאון.',
+        );
+      }
+    }
+    setSending(false);
+  }, [
+    issue,
+    draft,
+    composerFiles,
+    pendingReassignAgentId,
+    pendingReassignConfirmed,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -869,7 +1383,8 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
         style={
           {
             position: 'fixed',
-            top: 38,
+            // 38 connection banner + 38 bookmarks bar.
+            top: 76,
             right: 0,
             bottom: 0,
             width: 44,
@@ -950,6 +1465,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
         onClose={() => setTasksOpen(false)}
         chatCollapsed={true}
         size={size}
+        onNavigateToIssue={onSelectNode}
       />
       </>
     );
@@ -964,7 +1480,8 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
       style={
         {
           position: 'fixed',
-          top: 38,
+          // 38 connection banner + 38 bookmarks bar.
+          top: 76,
           right: 0,
           bottom: 0,
           width: 420,
@@ -1008,38 +1525,33 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             }}
           >
             {empty ? 'בחר סוכן במשרד' : agentName}
+            {agentPaused && !empty ? (
+              <span
+                title="הסוכן מושהה — Heartbeat לא ירוץ עד שיופעל מחדש"
+                style={{
+                  marginInlineStart: 8,
+                  fontSize: size(11),
+                  fontWeight: 700,
+                  padding: '2px 8px',
+                  borderRadius: 999,
+                  background: 'rgba(245,158,11,0.32)',
+                  color: '#fde68a',
+                  verticalAlign: 'middle',
+                }}
+              >
+                ⏸ מושהה
+              </span>
+            ) : null}
           </div>
           <div style={{ display: 'inline-flex', gap: 4, flexShrink: 0 }}>
-            <button
-              type="button"
-              title={tasksOpen ? 'סגור תוכנית' : 'פתח תוכנית'}
-              aria-label={tasksOpen ? 'סגור תוכנית' : 'פתח תוכנית'}
+            <IconButton
+              title="פרטי המשימה"
               onClick={onToggleTasks}
               disabled={empty || !issue}
-              style={{
-                height: 28,
-                paddingInline: 10,
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                background: tasksOpen
-                  ? 'rgba(255,255,255,0.28)'
-                  : 'rgba(255,255,255,0.12)',
-                color: '#fff',
-                border: 'none',
-                borderRadius: 7,
-                cursor: empty || !issue ? 'not-allowed' : 'pointer',
-                opacity: empty || !issue ? 0.4 : 1,
-                fontFamily: 'inherit',
-                fontSize: 12,
-                fontWeight: 700,
-                lineHeight: 1,
-                transition: 'background 0.15s',
-              }}
+              active={tasksOpen}
             >
-              <span style={{ fontSize: 13 }}>📋</span>
-              <span>תוכנית</span>
-            </button>
+              📋
+            </IconButton>
             <IconButton
               title="הקטן גופנים"
               onClick={onScaleDown}
@@ -1140,158 +1652,125 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                 {issue.title}
               </span>
               <span style={{ fontSize: size(11), opacity: 0.7, flexShrink: 0 }}>
-                {allIssues.length > 1 ? `${allIssues.length} ${pickerOpen ? '▲' : '▼'}` : ''}
+                {forestNodeCount > 1
+                  ? `${forestNodeCount} ${pickerOpen ? '▲' : '▼'}`
+                  : ''}
               </span>
             </button>
               ) : null}
-              {/* + שיחה חדשה — opens an inline title+description form.
-                  Submit creates the Issue assigned to the active agent and
-                  switches the thread. The form itself is rendered below
-                  the header so it doesn't disrupt the chip's layout. */}
+              {/* Goal chip removed (Session 1 follow-up) — operator
+                  found it redundant alongside the issues picker. Goal
+                  context is available in the GoalsModal (🎯 button in
+                  the bookmarks bar) when needed. */}
+              {/* 📌 Pin the active issue as a project-bookmark — for an
+                  issue that is the parent of a sub-task set. Visible only
+                  when an issue is open. */}
+              {issue ? (
+                <button
+                  type="button"
+                  onClick={() => onPinIssue(issue)}
+                  title="נעץ את המשימה כסימנייה"
+                  aria-label="נעץ את המשימה כסימנייה"
+                  style={{
+                    flexShrink: 0,
+                    width: 32,
+                    height: 32,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    background: 'rgba(255,255,255,0.12)',
+                    border: '1px solid rgba(255,255,255,0.18)',
+                    borderRadius: 8,
+                    color: '#fff',
+                    cursor: 'pointer',
+                    fontFamily: 'inherit',
+                    fontSize: 15,
+                    lineHeight: 1,
+                    transition: 'background 0.15s',
+                  }}
+                  onMouseEnter={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.background =
+                      'rgba(255,255,255,0.22)';
+                  }}
+                  onMouseLeave={(e) => {
+                    (e.currentTarget as HTMLButtonElement).style.background =
+                      'rgba(255,255,255,0.12)';
+                  }}
+                >
+                  📌
+                </button>
+              ) : null}
+              {/* + שיחה חדשה — icon-only round button with hover tooltip.
+                  Click opens the inline title+description form below the
+                  header. Green-tinted to match the user-action affordance
+                  in the header row. */}
               <button
                 type="button"
                 onClick={onOpenNewForm}
                 disabled={creatingConversation || newFormOpen}
-                title="פתח שיחה חדשה עם הסוכן"
+                title={creatingConversation ? 'פותח…' : 'שיחה חדשה'}
                 aria-label="פתח שיחה חדשה עם הסוכן"
                 style={{
                   flexShrink: 0,
+                  width: 32,
+                  height: 32,
                   display: 'inline-flex',
                   alignItems: 'center',
-                  gap: 4,
-                  padding: '6px 10px',
-                  background: 'rgba(34,197,94,0.18)',
-                  border: '1px solid rgba(34,197,94,0.45)',
+                  justifyContent: 'center',
+                  background: 'rgba(34,197,94,0.22)',
+                  border: '1px solid rgba(34,197,94,0.55)',
                   borderRadius: 8,
                   color: '#dcfce7',
                   cursor: creatingConversation ? 'not-allowed' : 'pointer',
                   opacity: creatingConversation ? 0.6 : 1,
                   fontFamily: 'inherit',
-                  fontSize: size(12),
+                  fontSize: 22,
                   fontWeight: 700,
-                  whiteSpace: 'nowrap',
-                  transition: 'background 0.15s',
+                  lineHeight: 1,
+                  transition: 'background 0.15s, transform 0.1s',
                 }}
                 onMouseEnter={(e) => {
                   if (!creatingConversation)
                     (e.currentTarget as HTMLButtonElement).style.background =
-                      'rgba(34,197,94,0.28)';
+                      'rgba(34,197,94,0.34)';
                 }}
                 onMouseLeave={(e) => {
                   (e.currentTarget as HTMLButtonElement).style.background =
-                    'rgba(34,197,94,0.18)';
+                    'rgba(34,197,94,0.22)';
                 }}
               >
-                <span style={{ fontSize: size(13) }}>＋</span>
-                <span>{creatingConversation ? 'פותח…' : 'שיחה חדשה'}</span>
+                {creatingConversation ? '…' : '+'}
               </button>
             </>
           )}
 
-          {/* Dropdown: list of all agent's issues. Anchored below the chip. */}
-          {pickerOpen && allIssues.length > 0 ? (
+          {/* Dropdown: the focused agent's issue FOREST — root issues
+              with nested sub-issues. Replaces the old flat list.
+              Anchored below the chip. */}
+          {pickerOpen ? (
             <div
               style={{
                 position: 'absolute',
                 top: 'calc(100% + 6px)',
                 insetInlineStart: 0,
                 insetInlineEnd: 0,
-                maxHeight: 320,
+                maxHeight: 380,
                 overflowY: 'auto',
                 background: '#1e293b',
                 border: '1px solid rgba(255,255,255,0.12)',
                 borderRadius: 10,
                 boxShadow: '0 6px 18px rgba(0,0,0,0.45)',
                 zIndex: 200,
-                padding: 6,
                 color: '#e2e8f0',
               }}
             >
-              {allIssues.map((it) => {
-                const active = issue?.id === it.id;
-                return (
-                  <button
-                    key={it.id}
-                    type="button"
-                    onClick={() => onSelectIssue(it)}
-                    title={`${it.identifier ?? '—'} · ${it.title} · ${statusLabel(it.status)}`}
-                    style={{
-                      width: '100%',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      padding: '8px 10px',
-                      background: active ? 'rgba(99,102,241,0.25)' : 'transparent',
-                      border: active
-                        ? '1px solid rgba(129,140,248,0.6)'
-                        : '1px solid transparent',
-                      borderRadius: 7,
-                      color: '#e2e8f0',
-                      cursor: 'pointer',
-                      textAlign: 'start',
-                      fontFamily: 'inherit',
-                      marginBlockEnd: 2,
-                      transition: 'background 0.12s',
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!active)
-                        (e.currentTarget as HTMLButtonElement).style.background =
-                          'rgba(255,255,255,0.06)';
-                    }}
-                    onMouseLeave={(e) => {
-                      if (!active)
-                        (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: 8,
-                        height: 8,
-                        borderRadius: '50%',
-                        background: statusColor(it.status),
-                        flexShrink: 0,
-                      }}
-                    />
-                    <span
-                      style={{
-                        fontSize: size(12),
-                        fontWeight: 700,
-                        background: 'rgba(255,255,255,0.08)',
-                        padding: '2px 6px',
-                        borderRadius: 4,
-                        flexShrink: 0,
-                        letterSpacing: 0.5,
-                      }}
-                    >
-                      {it.identifier ?? '—'}
-                    </span>
-                    <span
-                      style={{
-                        fontSize: size(13),
-                        flex: 1,
-                        minWidth: 0,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {it.title}
-                    </span>
-                    <span
-                      style={{
-                        fontSize: size(10),
-                        opacity: 0.7,
-                        flexShrink: 0,
-                        padding: '1px 5px',
-                        background: 'rgba(255,255,255,0.05)',
-                        borderRadius: 3,
-                      }}
-                    >
-                      {statusLabel(it.status)}
-                    </span>
-                  </button>
-                );
-              })}
+              <IssueTreePicker
+                forest={forest}
+                loading={forestLoading}
+                activeIssueId={issue?.id ?? null}
+                size={size}
+                onSelect={(node) => onSelectNode(node.issue)}
+              />
             </div>
           ) : null}
         </div>
@@ -1303,6 +1782,14 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
           creates the Issue and switches the active thread to it. */}
       {newFormOpen && !empty ? (
         <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            stageFiles(setNewFiles, e.dataTransfer.files);
+          }}
           style={{
             padding: '12px 14px',
             background: 'rgba(15, 23, 42, 0.85)',
@@ -1438,6 +1925,10 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
                 <option value="urgent" style={{ background: '#1e293b', color: '#f1f5f9' }}>דחופה</option>
               </select>
             </label>
+            {/* Goal picker removed (Session 1.1) — issues inherit goal
+                via parent issue. The header chip still displays the
+                inherited goal, but composing the link at create-time
+                proved redundant in operator review. */}
             <span
               style={{
                 fontSize: size(10),
@@ -1448,6 +1939,145 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
               מוקצה לסוכן: {agentName}
             </span>
           </div>
+
+          {/* Issue work mode — Standard (default executable task) vs.
+              Planning (ideation/decomposition unit). Pill toggle. */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: size(11),
+              color: '#cbd5e1',
+            }}
+          >
+            <span style={{ opacity: 0.8, marginInlineEnd: 4 }}>סוג:</span>
+            {(['standard', 'planning'] as PaperclipIssueWorkMode[]).map((mode) => {
+              const active = newWorkMode === mode;
+              const label = mode === 'planning' ? 'תכנון' : 'רגיל';
+              const hint =
+                mode === 'planning'
+                  ? 'משימת תכנון — הסוכן יפרק/יתכנן, לא יבצע ישירות'
+                  : 'משימה רגילה — הסוכן יבצע באופן ישיר';
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  title={hint}
+                  onClick={() => setNewWorkMode(mode)}
+                  disabled={creatingConversation}
+                  style={{
+                    padding: '4px 12px',
+                    borderRadius: 999,
+                    border: active
+                      ? '1px solid rgba(74,222,128,0.55)'
+                      : '1px solid rgba(255,255,255,0.12)',
+                    background: active
+                      ? 'rgba(34,197,94,0.18)'
+                      : 'transparent',
+                    color: active ? '#dcfce7' : '#cbd5e1',
+                    fontFamily: 'inherit',
+                    fontSize: size(11),
+                    fontWeight: 700,
+                    cursor: creatingConversation ? 'not-allowed' : 'pointer',
+                    transition: 'background 0.15s, color 0.15s',
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* File upload zone — paperclip button + chip strip. The
+              surrounding form div is itself a drop target so the user
+              can drag files anywhere over the panel. */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                fontSize: size(11),
+                color: '#cbd5e1',
+              }}
+            >
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  padding: '4px 10px',
+                  background: 'rgba(255,255,255,0.06)',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  borderRadius: 7,
+                  cursor: creatingConversation ? 'not-allowed' : 'pointer',
+                  opacity: creatingConversation ? 0.5 : 1,
+                  fontSize: size(11),
+                  fontWeight: 600,
+                }}
+                title="צרף קבצים — גם drag-and-drop נתמך לכל אזור הטופס"
+              >
+                <span aria-hidden style={{ fontSize: size(13) }}>📎</span>
+                <span>צרף קבצים</span>
+                <input
+                  type="file"
+                  multiple
+                  hidden
+                  disabled={creatingConversation}
+                  onChange={(e) => {
+                    stageFiles(setNewFiles, e.target.files);
+                    // Reset so the same file can be re-selected.
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+              {newFiles.length > 0 ? (
+                <span style={{ opacity: 0.6, fontSize: size(10) }}>
+                  {newFiles.length} קבצים · אפשר לגרור גם לאזור הטופס
+                </span>
+              ) : (
+                <span style={{ opacity: 0.45, fontSize: size(10) }}>
+                  או גרור קבצים לאזור הטופס
+                </span>
+              )}
+            </div>
+            {newFiles.length > 0 ? (
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 4,
+                }}
+              >
+                {newFiles.map((pf) => (
+                  <PendingFileChip
+                    key={pf.localId}
+                    pending={pf}
+                    size={size}
+                    onRemove={() =>
+                      setNewFiles((prev) =>
+                        prev.filter((f) => f.localId !== pf.localId),
+                      )
+                    }
+                    // Retry on the form: rebuild the chip with cleared
+                    // error so the next submit will try again. The
+                    // actual upload happens at submit time.
+                    onRetry={() =>
+                      setNewFiles((prev) =>
+                        prev.map((f) =>
+                          f.localId === pf.localId
+                            ? { ...f, error: null }
+                            : f,
+                        ),
+                      )
+                    }
+                  />
+                ))}
+              </div>
+            ) : null}
+          </div>
+
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <button
               type="button"
@@ -1665,7 +2295,12 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             if (item.kind !== 'comment') return null;
 
             const c = item.comment;
-            const author = authorFor(c, agentName);
+            // Multi-agent fidelity: resolve the author's REAL name per
+            // comment rather than defaulting to the chat-selected agent.
+            // `isAgentProduced` flips user-misattributed agent comments
+            // back to agent bubbles once the run back-fill confirms.
+            const isAgentProduced = commentAgentById.has(c.id);
+            const author = authorFor(c, isAgentProduced, resolveAgentName(c));
             const inlineAttachments = item.commentAttachments;
             const isHuman = author.type === 'human';
 
@@ -1824,7 +2459,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             comments={debriefComments}
             size={size}
             formatTime={formatTime}
-            agentName={agentName}
+            resolveAgentName={resolveAgentName}
           />
         ) : null}
 
@@ -1859,6 +2494,16 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
 
       {/* Input */}
       <footer
+        onDragOver={(e) => {
+          if (!issue) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        }}
+        onDrop={(e) => {
+          if (!issue) return;
+          e.preventDefault();
+          stageFiles(setComposerFiles, e.dataTransfer.files);
+        }}
         style={{
           padding: 12,
           borderBlockStart: '1px solid rgba(255,255,255,0.08)',
@@ -2008,7 +2653,189 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             ) : null}
           </div>
         ) : null}
+
+        {/* Pending-reassignment banner.
+            Picker selection no longer fires the PATCH immediately — it
+            stages the target here. The banner asks for approval; once
+            approved, the actual reassignment rides with the next message
+            (which is the context the new assignee will read on wake). */}
+        {pendingReassignAgentId && issue ? (() => {
+          const pendingName =
+            getAgentName(pendingReassignAgentId) ?? 'סוכן';
+          return (
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 6,
+                padding: '8px 10px',
+                background: pendingReassignConfirmed
+                  ? 'rgba(34,197,94,0.12)'
+                  : 'rgba(245,158,11,0.12)',
+                border: pendingReassignConfirmed
+                  ? '1px solid rgba(74,222,128,0.5)'
+                  : '1px solid rgba(251,191,36,0.5)',
+                borderRadius: 8,
+                fontSize: size(11),
+                color: '#e2e8f0',
+              }}
+            >
+              <div
+                style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+              >
+                <span aria-hidden style={{ fontSize: size(13) }}>
+                  {pendingReassignConfirmed ? '✓' : '🔁'}
+                </span>
+                <span style={{ flex: 1, lineHeight: 1.5 }}>
+                  {pendingReassignConfirmed ? (
+                    <>
+                      ההקצאה תוצמד להודעה הבאה — תועבר אל{' '}
+                      <strong>{pendingName}</strong>.
+                    </>
+                  ) : (
+                    <>
+                      שים לב — אתה מבקש להעביר אחריות למשימה אל{' '}
+                      <strong>{pendingName}</strong>.
+                    </>
+                  )}
+                </span>
+              </div>
+              {!pendingReassignConfirmed ? (
+                <div
+                  style={{
+                    fontSize: size(10),
+                    opacity: 0.75,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  לאחר השליחה המערכת תעריך את הבקשה לפי ההקשר. אם תזהה
+                  שעדיף שהמשימה תישאר אצל{' '}
+                  <strong>{currentAssigneeName}</strong> — תוצג לך הודעה
+                  בהתאם והאחריות עשויה להישאר אצלו.
+                </div>
+              ) : null}
+              <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  onClick={cancelPendingReassign}
+                  disabled={reassigning}
+                  style={{
+                    padding: '4px 10px',
+                    borderRadius: 6,
+                    border: '1px solid rgba(255,255,255,0.15)',
+                    background: 'transparent',
+                    color: '#cbd5e1',
+                    cursor: reassigning ? 'not-allowed' : 'pointer',
+                    fontFamily: 'inherit',
+                    fontSize: size(11),
+                    fontWeight: 700,
+                  }}
+                >
+                  בטל
+                </button>
+                {!pendingReassignConfirmed ? (
+                  <button
+                    type="button"
+                    onClick={confirmPendingReassign}
+                    style={{
+                      padding: '4px 12px',
+                      borderRadius: 6,
+                      border: '1px solid rgba(74,222,128,0.55)',
+                      background: 'rgba(34,197,94,0.22)',
+                      color: '#dcfce7',
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                      fontSize: size(11),
+                      fontWeight: 700,
+                    }}
+                  >
+                    אשר
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          );
+        })() : null}
+
+        {/* Pending-files strip — shown only when files are staged.
+            Drag-drop on the footer adds to this list. Each chip can be
+            removed or, if marked with an error, retried by clearing
+            the error so the next Send tries again. */}
+        {composerFiles.length > 0 ? (
+          <div
+            style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: 4,
+              padding: '4px 0',
+            }}
+          >
+            {composerFiles.map((pf) => (
+              <PendingFileChip
+                key={pf.localId}
+                pending={pf}
+                size={size}
+                onRemove={() =>
+                  setComposerFiles((prev) =>
+                    prev.filter((f) => f.localId !== pf.localId),
+                  )
+                }
+                onRetry={() =>
+                  setComposerFiles((prev) =>
+                    prev.map((f) =>
+                      f.localId === pf.localId ? { ...f, error: null } : f,
+                    ),
+                  )
+                }
+              />
+            ))}
+            {/* Hint — files alone can't be sent; a message is required. */}
+            {draft.trim().length === 0 ? (
+              <span
+                style={{
+                  fontSize: size(10),
+                  color: '#fbbf24',
+                  alignSelf: 'center',
+                  marginInlineStart: 4,
+                }}
+              >
+                כתוב הודעה כדי לשלוח את הצרופות
+              </span>
+            ) : null}
+          </div>
+        ) : null}
         <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+        <label
+          title="צרף קבצים (גם drag-and-drop)"
+          aria-label="צרף קבצים"
+          style={{
+            width: 44,
+            minHeight: 44,
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            borderRadius: 10,
+            color: '#cbd5e1',
+            cursor: empty || !issue || sending ? 'not-allowed' : 'pointer',
+            opacity: empty || !issue || sending ? 0.4 : 1,
+            fontSize: size(18),
+            flexShrink: 0,
+          }}
+        >
+          📎
+          <input
+            type="file"
+            multiple
+            hidden
+            disabled={empty || !issue || sending}
+            onChange={(e) => {
+              stageFiles(setComposerFiles, e.target.files);
+              e.target.value = '';
+            }}
+          />
+        </label>
         <textarea
           dir="rtl"
           rows={1}
@@ -2035,29 +2862,40 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
             outline: 'none',
           }}
         />
-        <button
-          type="button"
-          onClick={() => void handleSend()}
-          disabled={empty || !issue || sending || draft.trim().length === 0}
-          style={{
-            background: '#16a34a',
-            color: '#fff',
-            border: 'none',
-            borderRadius: 10,
-            padding: '10px 18px',
-            fontSize: size(15),
-            fontWeight: 700,
-            cursor:
-              empty || !issue || sending || draft.trim().length === 0
-                ? 'not-allowed'
-                : 'pointer',
-            opacity:
-              empty || !issue || sending || draft.trim().length === 0 ? 0.5 : 1,
-            fontFamily: 'inherit',
-          }}
-        >
-          {sending ? '…' : 'שלח'}
-        </button>
+        {(() => {
+          // Send requires a non-empty text message. Attachments may
+          // accompany it but never substitute for it. A staged file
+          // with a client-side error also blocks the send until it's
+          // removed or retried.
+          const hasFileErrors = composerFiles.some((f) => f.error != null);
+          const sendDisabled =
+            empty ||
+            !issue ||
+            sending ||
+            hasFileErrors ||
+            draft.trim().length === 0;
+          return (
+            <button
+              type="button"
+              onClick={() => void handleSend()}
+              disabled={sendDisabled}
+              style={{
+                background: '#16a34a',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 10,
+                padding: '10px 18px',
+                fontSize: size(15),
+                fontWeight: 700,
+                cursor: sendDisabled ? 'not-allowed' : 'pointer',
+                opacity: sendDisabled ? 0.5 : 1,
+                fontFamily: 'inherit',
+              }}
+            >
+              {sending ? '…' : 'שלח'}
+            </button>
+          );
+        })()}
         </div>
       </footer>
     </aside>
@@ -2067,6 +2905,7 @@ export function WhatsAppPanel({ selectedAgentId, selectedAgentName }: WhatsAppPa
       onClose={() => setTasksOpen(false)}
       chatCollapsed={false}
       size={size}
+      onNavigateToIssue={onSelectNode}
     />
     </>
   );

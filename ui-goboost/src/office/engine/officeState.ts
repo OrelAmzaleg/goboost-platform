@@ -31,6 +31,12 @@ import type {
   TileType as TileTypeVal,
 } from '../types.js';
 import { CharacterState, Direction, MATRIX_EFFECT_DURATION, TILE_SIZE } from '../types.js';
+import {
+  SPEECH_DURATION_SEC,
+  SPEECH_PRIORITY,
+  pickPhrase,
+  type SpeechCategory,
+} from './agentSpeech.js';
 import { createCharacter, updateCharacter } from './characters.js';
 import { matrixEffectSeeds } from './matrixEffect.js';
 
@@ -672,6 +678,47 @@ export class OfficeState {
     }
   }
 
+  /**
+   * Show a text speech bubble above an agent's head.
+   *
+   * Priority semantics: if the agent already has a higher-priority
+   * bubble showing, the call is silently dropped — we don't want a
+   * brief "thinking" event to overwrite a persistent "approval pending"
+   * bubble, for example. Equal or higher priority replaces.
+   *
+   * No-op if the agent isn't currently in the office (matches the
+   * existing `showWaitingBubble` pattern).
+   */
+  setSpeechBubble(uuidOrNumericId: number, category: SpeechCategory): void {
+    const ch = this.characters.get(uuidOrNumericId);
+    if (!ch) return;
+    const current = ch.speechBubble;
+    if (current && SPEECH_PRIORITY[current.category] > SPEECH_PRIORITY[category]) {
+      return;
+    }
+    const lifetime = SPEECH_DURATION_SEC[category];
+    const phrase = pickPhrase(category, current?.phrase ?? null);
+    ch.speechBubble = {
+      category,
+      phrase,
+      expiresAt: lifetime == null ? null : Date.now() + lifetime * 1000,
+    };
+  }
+
+  /**
+   * Clear a speech bubble. If `onlyCategory` is given, the bubble is
+   * cleared only if it currently displays that category — used by the
+   * bridge to release an approval-pending bubble when the approval
+   * resolves, without clobbering a newer bubble that may have replaced
+   * it in the meantime.
+   */
+  clearSpeechBubble(id: number, onlyCategory?: SpeechCategory): void {
+    const ch = this.characters.get(id);
+    if (!ch || !ch.speechBubble) return;
+    if (onlyCategory && ch.speechBubble.category !== onlyCategory) return;
+    ch.speechBubble = null;
+  }
+
   /** Dismiss bubble on click — permission: instant, waiting: quick fade */
   dismissBubble(id: number): void {
     const ch = this.characters.get(id);
@@ -750,6 +797,12 @@ export class OfficeState {
         if (ch.bubbleTimer <= 0) {
           ch.bubbleType = null;
           ch.bubbleTimer = 0;
+        }
+      }
+      // Expire text speech bubbles (wall-clock based; `null` = persistent).
+      if (ch.speechBubble && ch.speechBubble.expiresAt != null) {
+        if (Date.now() >= ch.speechBubble.expiresAt) {
+          ch.speechBubble = null;
         }
       }
     }

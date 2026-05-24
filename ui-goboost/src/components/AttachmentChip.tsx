@@ -5,6 +5,7 @@ import {
   attachmentMimeType,
   type PaperclipAttachment,
 } from '../paperclipApi.js';
+import { humanBytes, iconForMime } from './attachmentHelpers.js';
 
 /**
  * AttachmentChip — Stream 5 / Primitives #8 (inline) and #9 (standalone).
@@ -29,33 +30,8 @@ export interface AttachmentChipProps {
   formatTime?: (iso: string) => string;
 }
 
-const ICON_FOR_MIME: Array<[RegExp, string]> = [
-  [/^image\//, '🖼'],
-  [/pdf$/, '📕'],
-  [/word|officedocument\.wordprocessing/, '📘'],
-  [/spreadsheet|excel|csv/, '📊'],
-  [/presentation|powerpoint/, '📙'],
-  [/zip|tar|gzip|7z|rar/, '🗜'],
-  [/audio\//, '🎵'],
-  [/video\//, '🎬'],
-  [/text\//, '📄'],
-  [/json|yaml|toml|xml/, '🧾'],
-];
-
-function iconFor(mime: string): string {
-  for (const [rx, icon] of ICON_FOR_MIME) {
-    if (rx.test(mime)) return icon;
-  }
-  return '📎';
-}
-
-function humanSize(bytes?: number | null): string | null {
-  if (bytes == null || !Number.isFinite(bytes)) return null;
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}
+// Icon + size helpers now live in `./attachmentHelpers.ts` so the upload
+// form, chips, and Tasks Panel all use the same vocabulary.
 
 export function AttachmentChip({ attachment, mode, size, formatTime }: AttachmentChipProps) {
   const filename = attachmentFilename(attachment);
@@ -85,7 +61,7 @@ export function AttachmentChip({ attachment, mode, size, formatTime }: Attachmen
           fontSize: size(11),
           maxWidth: '100%',
         }}
-        title={`${filename}${humanSize(bytes) ? ` · ${humanSize(bytes)}` : ''}`}
+        title={`${filename}${humanBytes(bytes) ? ` · ${humanBytes(bytes)}` : ''}`}
       >
         {isImage ? (
           <img
@@ -101,7 +77,7 @@ export function AttachmentChip({ attachment, mode, size, formatTime }: Attachmen
           />
         ) : (
           <span aria-hidden style={{ fontSize: size(13), flexShrink: 0 }}>
-            {iconFor(mime)}
+            {iconForMime(mime)}
           </span>
         )}
         <span
@@ -116,8 +92,8 @@ export function AttachmentChip({ attachment, mode, size, formatTime }: Attachmen
         >
           {filename}
         </span>
-        {humanSize(bytes) ? (
-          <span style={{ opacity: 0.65, flexShrink: 0 }}>{humanSize(bytes)}</span>
+        {humanBytes(bytes) ? (
+          <span style={{ opacity: 0.65, flexShrink: 0 }}>{humanBytes(bytes)}</span>
         ) : null}
       </a>
     );
@@ -166,7 +142,7 @@ export function AttachmentChip({ attachment, mode, size, formatTime }: Attachmen
             flexShrink: 0,
           }}
         >
-          {iconFor(mime)}
+          {iconForMime(mime)}
         </span>
       )}
       <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -183,7 +159,7 @@ export function AttachmentChip({ attachment, mode, size, formatTime }: Attachmen
         </div>
         <div style={{ fontSize: size(11), opacity: 0.7, display: 'flex', gap: 8 }}>
           {mime ? <span>{mime}</span> : null}
-          {humanSize(bytes) ? <span>· {humanSize(bytes)}</span> : null}
+          {humanBytes(bytes) ? <span>· {humanBytes(bytes)}</span> : null}
           {formatTime ? <span>· {formatTime(attachment.createdAt)}</span> : null}
         </div>
       </div>

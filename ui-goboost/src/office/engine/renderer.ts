@@ -486,6 +486,114 @@ function renderRotateButton(
 
 // ── Speech bubbles ──────────────────────────────────────────────
 
+// ── Text speech bubbles (driven by agentSpeechBridge) ─────────────
+//
+// Distinct layer from `renderBubbles` above: those are sprite icons
+// for the existing permission/waiting affordances. These are short
+// Hebrew lines like "הבנתי, בודק..." that mirror the agent's current
+// activity in the chat panel. The two coexist; the speech bubble is
+// positioned a bit higher so it doesn't overlap the icon bubble when
+// both are active.
+
+const SPEECH_FONT_PX = 11;
+const SPEECH_FONT = `${SPEECH_FONT_PX}px 'Heebo', 'Assistant', system-ui, sans-serif`;
+const SPEECH_PAD_X = 7;
+const SPEECH_PAD_Y = 4;
+const SPEECH_MAX_WIDTH = 180; // px before zoom
+const SPEECH_RADIUS = 6;
+const SPEECH_TAIL_H = 4;
+const SPEECH_GAP_ABOVE_HEAD = 22; // px above the character anchor
+
+function renderSpeechBubbles(
+  ctx: CanvasRenderingContext2D,
+  characters: Character[],
+  offsetX: number,
+  offsetY: number,
+  zoom: number,
+): void {
+  ctx.save();
+  // Text rendering: device-pixel font size (no zoom). Bubbles stay
+  // readable at any office zoom level — they're a UI overlay, not a
+  // pixel-art element. Position is computed in world coords then drawn
+  // at device-pixel size centered on that point.
+  ctx.font = SPEECH_FONT;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  // Hebrew direction hint for the canvas text shaper.
+  // (Browsers vary in respect; most respect it for `direction: 'rtl'`.)
+  // Falls back gracefully if unsupported.
+  try {
+    (ctx as CanvasRenderingContext2D & { direction?: string }).direction = 'rtl';
+  } catch {
+    /* noop */
+  }
+
+  for (const ch of characters) {
+    if (!ch.speechBubble) continue;
+    if (ch.matrixEffect === 'despawn') continue;
+    const text = ch.speechBubble.phrase;
+    if (!text) continue;
+
+    // Measure (clamp to max width — long phrases are rare but truncate).
+    const metrics = ctx.measureText(text);
+    const textW = Math.min(Math.ceil(metrics.width), SPEECH_MAX_WIDTH);
+    const boxW = textW + SPEECH_PAD_X * 2;
+    const boxH = SPEECH_FONT_PX + SPEECH_PAD_Y * 2;
+
+    // Anchor: above head, centered on character. Match the existing
+    // `renderBubbles` sitting-offset logic so a seated agent's bubble
+    // doesn't float in mid-air above an empty seat.
+    const sittingOff = ch.state === CharacterState.TYPE ? BUBBLE_SITTING_OFFSET_PX : 0;
+    const cx = Math.round(offsetX + ch.x * zoom);
+    // Sit it above the head; if an icon bubble is also showing, the
+    // text bubble lives further up (icon ≈ 8px tall).
+    const iconOffset = ch.bubbleType ? 12 : 0;
+    const baseY = Math.round(
+      offsetY + (ch.y + sittingOff) * zoom - SPEECH_GAP_ABOVE_HEAD - iconOffset,
+    );
+    const boxLeft = cx - Math.round(boxW / 2);
+    const boxTop = baseY - boxH;
+
+    // Rounded rect background
+    ctx.beginPath();
+    const r = SPEECH_RADIUS;
+    ctx.moveTo(boxLeft + r, boxTop);
+    ctx.lineTo(boxLeft + boxW - r, boxTop);
+    ctx.arcTo(boxLeft + boxW, boxTop, boxLeft + boxW, boxTop + r, r);
+    ctx.lineTo(boxLeft + boxW, boxTop + boxH - r);
+    ctx.arcTo(boxLeft + boxW, boxTop + boxH, boxLeft + boxW - r, boxTop + boxH, r);
+    ctx.lineTo(boxLeft + r, boxTop + boxH);
+    ctx.arcTo(boxLeft, boxTop + boxH, boxLeft, boxTop + boxH - r, r);
+    ctx.lineTo(boxLeft, boxTop + r);
+    ctx.arcTo(boxLeft, boxTop, boxLeft + r, boxTop, r);
+    ctx.closePath();
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.96)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(15, 23, 42, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Tail (small triangle below the bubble, pointing at the head)
+    const tailCenterX = cx;
+    const tailTopY = boxTop + boxH;
+    ctx.beginPath();
+    ctx.moveTo(tailCenterX - 4, tailTopY);
+    ctx.lineTo(tailCenterX + 4, tailTopY);
+    ctx.lineTo(tailCenterX, tailTopY + SPEECH_TAIL_H);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.96)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(15, 23, 42, 0.55)';
+    ctx.stroke();
+
+    // Text
+    ctx.fillStyle = '#0f172a';
+    ctx.fillText(text, cx, boxTop + boxH / 2, SPEECH_MAX_WIDTH);
+  }
+  ctx.restore();
+}
+
 function renderBubbles(
   ctx: CanvasRenderingContext2D,
   characters: Character[],
@@ -624,6 +732,9 @@ export function renderFrame(
 
   // Speech bubbles (always on top of characters)
   renderBubbles(ctx, characters, offsetX, offsetY, zoom);
+  // Text speech bubbles — chat-runtime activity narration, separate
+  // layer (can coexist with the icon bubbles above).
+  renderSpeechBubbles(ctx, characters, offsetX, offsetY, zoom);
 
   // Editor overlays
   if (editor) {

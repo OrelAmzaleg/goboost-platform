@@ -102,6 +102,46 @@ export function subscribeHeartbeatEvents(listener: HeartbeatEventListener): () =
   return () => heartbeatListeners.delete(listener);
 }
 
+// ── Run lifecycle (queued / running / terminal) ─────────────────
+//
+// `heartbeat.run.event` (above) carries internal instrumentation —
+// adapter.invoke, lifecycle, error. The actual run state transitions
+// (queued → running → succeeded|failed|cancelled|timed_out) arrive on
+// the separate WS types `heartbeat.run.queued` and `heartbeat.run.status`.
+//
+// Both originally only updated agent-status internally. The office's
+// speech-bubble bridge needs them too — they are the EARLIEST and most
+// reliable signal that "a user just pinged this agent" / "the run is
+// now actively executing". So we expose a dedicated subscription that
+// fans both event types out as one normalized stream.
+export interface PaperclipRunStatusEvent {
+  /** 'queued' = run just enqueued (earliest moment we know about it).
+   *  Any other value comes verbatim from `heartbeat.run.status` — typically
+   *  'running' / 'succeeded' / 'failed' / 'cancelled' / 'timed_out'. */
+  kind: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'timed_out' | string;
+  agentId: string;
+  runId: string;
+  createdAt: string;
+}
+
+type RunStatusListener = (event: PaperclipRunStatusEvent) => void;
+const runStatusListeners = new Set<RunStatusListener>();
+
+export function subscribeRunStatus(listener: RunStatusListener): () => void {
+  runStatusListeners.add(listener);
+  return () => runStatusListeners.delete(listener);
+}
+
+function emitRunStatus(event: PaperclipRunStatusEvent): void {
+  for (const fn of runStatusListeners) {
+    try {
+      fn(event);
+    } catch (err) {
+      console.warn('[PaperclipApi] run-status listener threw:', err);
+    }
+  }
+}
+
 function emitHeartbeatEvent(event: PaperclipHeartbeatEvent): void {
   for (const fn of heartbeatListeners) {
     try {
@@ -159,6 +199,8 @@ export interface PaperclipIssue {
   id: string;
   companyId: string;
   parentId: string | null;
+  /** Project this issue belongs to — null when unscoped. */
+  projectId: string | null;
   title: string;
   description: string | null;
   status: string;
@@ -168,6 +210,8 @@ export interface PaperclipIssue {
   createdByAgentId: string | null;
   createdByUserId: string | null;
   identifier?: string | null;
+  /** Goal the issue is contributing to (single, optional). */
+  goalId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -486,6 +530,50 @@ export function attachmentMimeType(att: PaperclipAttachment): string {
 }
 export function attachmentByteSize(att: PaperclipAttachment): number | null {
   return att.byteSize ?? att.asset?.byteSize ?? null;
+}
+
+/**
+ * Upload a file as an attachment on an issue.
+ *
+ * Endpoint: `POST /companies/:companyId/issues/:issueId/attachments`
+ * Body: multipart/form-data — field `file` carries the binary, optional
+ * `issueCommentId` field binds the attachment to a specific comment.
+ *
+ * Returns the full attachment row (with `id`, `contentPath`,
+ * `originalFilename`, `byteSize`, etc) — callers should add it to local
+ * state so the new file appears immediately, without waiting for the
+ * WebSocket activity round-trip.
+ *
+ * Server-side default cap is 10 MB; callers should pre-validate via
+ * `validateAttachmentSize` from attachmentHelpers.ts to give the user
+ * a clean inline error instead of an opaque 413.
+ */
+export async function uploadIssueAttachment(
+  issueId: string,
+  file: File,
+  opts?: { issueCommentId?: string | null },
+): Promise<PaperclipAttachment | null> {
+  if (!moduleCompanyId) {
+    console.warn('[PaperclipApi] uploadIssueAttachment before companyId is set');
+    return null;
+  }
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues/${encodeURIComponent(issueId)}/attachments`;
+  const form = new FormData();
+  form.append('file', file, file.name);
+  if (opts?.issueCommentId) {
+    form.append('issueCommentId', opts.issueCommentId);
+  }
+  try {
+    const r = await fetch(url, { method: 'POST', body: form });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipAttachment;
+  } catch (err) {
+    console.warn('[PaperclipApi] uploadIssueAttachment failed:', err);
+    return null;
+  }
 }
 
 export async function fetchIssueAttachments(
@@ -847,6 +935,19 @@ export function uuidForNumericAgentId(numericId: number): string | null {
 }
 
 /**
+ * Translate Paperclip UUID → numeric pixel-agents id. Used by the chat
+ * panel to "re-home" the visual office when navigating to an issue owned
+ * by a different agent — it dispatches `agentSelected` with this numeric
+ * id. Every agent that exists has already been registered via the
+ * bootstrap `agentCreated` dispatch, so `toNumeric` returns the existing
+ * mapping rather than minting a new one.
+ */
+export function numericIdForAgentUuid(uuid: string): number | null {
+  if (!moduleIdMapper) return null;
+  return moduleIdMapper.toNumeric(uuid);
+}
+
+/**
  * List issues assigned to a given agent (most recent first). Backend
  * default ordering is `updatedAt DESC`.
  */
@@ -867,6 +968,1071 @@ export async function fetchAgentIssues(agentUuid: string): Promise<PaperclipIssu
     return [];
   } catch (err) {
     console.warn('[PaperclipApi] fetchAgentIssues failed:', err);
+    return [];
+  }
+}
+
+/**
+ * A project — the framing unit one level above issues. The bookmarks bar
+ * renders one tab per project. Fields mirror Paperclip's `projects` table;
+ * we keep only what the UI needs.
+ */
+export interface PaperclipProject {
+  id: string;
+  companyId: string;
+  name: string;
+  description: string | null;
+  status: string;
+  color: string | null;
+  leadAgentId: string | null;
+  targetDate: string | null;
+  archivedAt: string | null;
+  /** Linked goal ids — present when the API hydrates the response. */
+  goalIds?: string[] | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** List the company's projects. Used to build the bookmarks bar. */
+export async function fetchCompanyProjects(): Promise<PaperclipProject[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/projects`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipProject[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { projects?: unknown }).projects)) {
+      return (raw as { projects: PaperclipProject[] }).projects;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanyProjects failed:', err);
+    return [];
+  }
+}
+
+/** Fields editable when creating or updating a project. */
+export interface ProjectInput {
+  name?: string;
+  description?: string | null;
+  status?: string;
+  color?: string | null;
+  targetDate?: string | null;
+  leadAgentId?: string | null;
+  /** Goal ids linked to the project (Paperclip's `goalIds` array). */
+  goalIds?: string[];
+}
+
+/** Create a project. `name` is required. Returns the new project row. */
+export async function createProject(
+  input: ProjectInput,
+): Promise<PaperclipProject | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/projects`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipProject;
+  } catch (err) {
+    console.warn('[PaperclipApi] createProject failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Update a project (partial). Endpoint: `PATCH /projects/:id`.
+ * Archiving is a PATCH that sets `archivedAt`; see `archiveProject`.
+ */
+export async function updateProject(
+  projectId: string,
+  patch: ProjectInput & { archivedAt?: string | null },
+): Promise<PaperclipProject | null> {
+  const url = `${moduleBaseUrl}/api/projects/${encodeURIComponent(projectId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipProject;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateProject failed:', err);
+    return null;
+  }
+}
+
+/** Archive a project — soft-delete via `archivedAt` timestamp. */
+export function archiveProject(
+  projectId: string,
+): Promise<PaperclipProject | null> {
+  return updateProject(projectId, { archivedAt: new Date().toISOString() });
+}
+
+/** Un-archive a project — clears `archivedAt`. */
+export function unarchiveProject(
+  projectId: string,
+): Promise<PaperclipProject | null> {
+  return updateProject(projectId, { archivedAt: null });
+}
+
+// ── Goals ────────────────────────────────────────────────────────
+//
+// Paperclip's `goals` table is a flat list with optional parent linkage
+// (`parentId`) so a company can build a goal tree (e.g. company-level →
+// team-level → agent-level). Goals are referenced by projects via
+// `projects.goalIds[]` and by issues via `issues.goalId` (single).
+//
+// The level + status enums are mirrored from the Paperclip backend
+// schema. Exporting them as `as const` arrays lets the Goals modal
+// drive its dropdowns from the same source of truth.
+
+export const GOAL_LEVELS = ['company', 'team', 'agent', 'task'] as const;
+export type GoalLevel = (typeof GOAL_LEVELS)[number];
+
+export const GOAL_STATUSES = ['planned', 'active', 'achieved', 'cancelled'] as const;
+export type GoalStatus = (typeof GOAL_STATUSES)[number];
+
+/**
+ * A goal row from Paperclip. Used by the Goals modal (CRUD) AND the
+ * project create/edit modals (read-only selector).
+ */
+export interface PaperclipGoal {
+  id: string;
+  companyId: string;
+  title: string;
+  description: string | null;
+  /** Hierarchy band — narrows what the goal is "about". */
+  level: GoalLevel;
+  status: GoalStatus;
+  /** Parent goal for tree structure; null = top-level. */
+  parentId: string | null;
+  /** Agent responsible for advancing this goal; null = unassigned. */
+  ownerAgentId: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/**
+ * The body shape accepted by POST `/companies/:id/goals` and PATCH
+ * `/goals/:id`. All fields are optional on PATCH; `title` + `level` are
+ * required on POST. Matches Paperclip's `upsertGoalSchema`.
+ */
+export interface GoalInput {
+  title?: string;
+  description?: string | null;
+  level?: GoalLevel;
+  status?: GoalStatus;
+  parentId?: string | null;
+  ownerAgentId?: string | null;
+}
+
+/** List the company's goals — for the Goals modal AND the project modals' goal multi-select. */
+export async function fetchCompanyGoals(): Promise<PaperclipGoal[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/goals`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipGoal[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { goals?: unknown }).goals)) {
+      return (raw as { goals: PaperclipGoal[] }).goals;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanyGoals failed:', err);
+    return [];
+  }
+}
+
+// ── Agent lifecycle actions ──────────────────────────────────────
+//
+// Mirror of the action buttons on Paperclip's per-agent dashboard.
+// All return `true` on HTTP success, `false` on any failure (network /
+// 4xx / 5xx). Callers refetch the agent's state either way so a brief
+// 4xx doesn't leave the UI inconsistent.
+
+async function postAgentAction(
+  agentId: string,
+  action: 'heartbeat/invoke' | 'pause' | 'resume' | 'wakeup' | 'terminate',
+  body?: Record<string, unknown>,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/${action}`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    });
+    if (!r.ok) {
+      console.warn(`[PaperclipApi] agent action ${action} failed:`, r.status);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[PaperclipApi] agent action ${action} threw:`, err);
+    return false;
+  }
+}
+
+/** Invoke a heartbeat run manually (the ❤️ toolbar button). */
+export function invokeAgentHeartbeat(agentId: string): Promise<boolean> {
+  return postAgentAction(agentId, 'heartbeat/invoke');
+}
+
+/** Pause an agent — sets status to "paused" until resume. */
+export function pauseAgent(agentId: string): Promise<boolean> {
+  return postAgentAction(agentId, 'pause');
+}
+
+/** Resume a paused agent. */
+export function resumeAgent(agentId: string): Promise<boolean> {
+  return postAgentAction(agentId, 'resume');
+}
+
+/** Wake an idle/sleeping agent (the 💭 button). */
+export function wakeupAgent(agentId: string): Promise<boolean> {
+  return postAgentAction(agentId, 'wakeup');
+}
+
+/** Terminate an agent — permanent until re-approved. The ✕ button. */
+export function terminateAgent(agentId: string): Promise<boolean> {
+  return postAgentAction(agentId, 'terminate');
+}
+
+/** Detailed agent record from `GET /agents/:id`. Superset of the summary. */
+export interface PaperclipAgentDetail extends PaperclipAgentSummary {
+  description?: string | null;
+  icon?: string | null;
+  // Renamed `adapter` → `adapterType` (Session 5): matches the actual
+  // backend column. `adapter` is kept transitively-deprecated; new
+  // code should always use `adapterType`.
+  adapterType?: string | null;
+  adapterConfig?: Record<string, unknown> | null;
+  runtimeConfig?: Record<string, unknown> | null;
+  model?: string | null;
+  maxConcurrentRuns?: number | null;
+  budgetMonthlyCents?: number | null;
+  permissions?: Record<string, boolean> | null;
+  capabilities?: string | null;
+  defaultEnvironmentId?: string | null;
+  desiredSkills?: string[] | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+/** Fetch the full agent record. Used by the AgentManagementModal. */
+export async function fetchAgentById(
+  agentId: string,
+): Promise<PaperclipAgentDetail | null> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipAgentDetail;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentById failed:', err);
+    return null;
+  }
+}
+
+// ── Budget overview ──────────────────────────────────────────────
+//
+// Paperclip's budget endpoints return per-scope (company/project/agent)
+// monthly spend caps + actual usage. The agent dashboard's Budget tab
+// reads the per-agent slice and writes back a new cap when the user
+// edits it. We expose the minimum surface needed for both.
+
+export interface PaperclipBudgetPolicy {
+  scopeType: 'company' | 'project' | 'agent';
+  scopeId: string | null;
+  monthlyCents: number;
+  /** "ok" | "hard_stop" | "paused" — drives the status pill. */
+  status?: string;
+}
+
+export interface PaperclipBudgetOverviewEntry {
+  scopeType: string;
+  scopeId: string | null;
+  monthlyCents: number;
+  spentThisMonthCents: number;
+  remainingCents: number;
+  status: string;
+}
+
+export interface PaperclipBudgetOverview {
+  entries: PaperclipBudgetOverviewEntry[];
+}
+
+export async function fetchBudgetOverview(): Promise<PaperclipBudgetOverview | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/budgets/overview`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) {
+      return { entries: raw as PaperclipBudgetOverviewEntry[] };
+    }
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { entries?: unknown };
+      if (Array.isArray(obj.entries)) {
+        return { entries: obj.entries as PaperclipBudgetOverviewEntry[] };
+      }
+    }
+    return { entries: [] };
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchBudgetOverview failed:', err);
+    return null;
+  }
+}
+
+export async function upsertBudgetPolicy(
+  policy: PaperclipBudgetPolicy & { windowKind?: string },
+): Promise<boolean> {
+  if (!moduleCompanyId) return false;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/budgets/policies`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scopeType: policy.scopeType,
+        scopeId: policy.scopeId,
+        monthlyCents: policy.monthlyCents,
+        windowKind: policy.windowKind ?? 'monthly',
+      }),
+    });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] upsertBudgetPolicy failed:', err);
+    return false;
+  }
+}
+
+// ── Agent skills ─────────────────────────────────────────────────
+
+export interface PaperclipAgentSkill {
+  id: string;
+  name: string;
+  description?: string | null;
+  /** True when the skill is read-only / managed by the platform. */
+  managed?: boolean;
+  /** Last sync status from Paperclip — e.g. "ok", "stale", "error". */
+  syncStatus?: string | null;
+  /** Optional source identifier (file path or package name). */
+  source?: string | null;
+}
+
+export async function fetchAgentSkills(
+  agentId: string,
+): Promise<PaperclipAgentSkill[]> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/skills`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipAgentSkill[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { skills?: unknown };
+      if (Array.isArray(obj.skills)) return obj.skills as PaperclipAgentSkill[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentSkills failed:', err);
+    return [];
+  }
+}
+
+// ── Heartbeat runs (history + drill-down) ────────────────────────
+
+export interface PaperclipHeartbeatRunSummary {
+  id: string;
+  agentId: string;
+  status: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  invocationSource?: string | null;
+  triggerDetail?: string | null;
+  /** Aggregated metrics, when the backend provides them on the summary. */
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  costCents?: number | null;
+  model?: string | null;
+  provider?: string | null;
+}
+
+/** Per-agent run list, newest first. Backend caps to ~50 most recent. */
+export async function fetchAgentRuns(
+  agentId: string,
+  limit = 30,
+): Promise<PaperclipHeartbeatRunSummary[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/heartbeat-runs?agentId=${encodeURIComponent(agentId)}&limit=${limit}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipHeartbeatRunSummary[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { runs?: unknown };
+      if (Array.isArray(obj.runs)) return obj.runs as PaperclipHeartbeatRunSummary[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentRuns failed:', err);
+    return [];
+  }
+}
+
+export interface PaperclipRunLogChunk {
+  ts: string;
+  stream: string;
+  chunk: string;
+}
+
+export async function fetchRunLog(
+  runId: string,
+): Promise<PaperclipRunLogChunk[]> {
+  const url = `${moduleBaseUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}/log`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipRunLogChunk[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { entries?: unknown; log?: unknown };
+      if (Array.isArray(obj.entries)) return obj.entries as PaperclipRunLogChunk[];
+      if (Array.isArray(obj.log)) return obj.log as PaperclipRunLogChunk[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRunLog failed:', err);
+    return [];
+  }
+}
+
+export async function cancelRun(runId: string): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}/cancel`;
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] cancelRun failed:', err);
+    return false;
+  }
+}
+
+// ── Agent configuration (Session 5) ──────────────────────────────
+//
+// Three endpoints live here, mirroring Paperclip's own Configuration
+// tab:
+//   GET  /agents/:id/configuration       → live config snapshot
+//   GET  /agents/:id/config-revisions    → history list
+//   GET  /agents/:id/config-revisions/:r → single revision detail
+//   POST /agents/:id/config-revisions/:r/rollback → restore
+//   PATCH /agents/:id/permissions        → permissions (separate from
+//                                          the main PATCH agent endpoint)
+//
+// Update writes use `updateAgent` (already defined above), which hits
+// `PATCH /agents/:id` with the merged adapterConfig semantics. Pass
+// `replaceAdapterConfig: true` in the patch to fully replace rather
+// than shallow-merge (we use merge by default — safer when the UI
+// only knows about a subset of keys).
+
+export interface PaperclipAgentPermissions {
+  canCreateAgents: boolean;
+  canAssignTasks: boolean;
+}
+
+export interface PaperclipAgentConfiguration {
+  id: string;
+  companyId: string;
+  name: string;
+  role?: string | null;
+  title?: string | null;
+  status?: string | null;
+  reportsTo?: string | null;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+  runtimeConfig: Record<string, unknown>;
+  permissions: PaperclipAgentPermissions;
+  updatedAt?: string;
+}
+
+export async function fetchAgentConfiguration(
+  agentId: string,
+): Promise<PaperclipAgentConfiguration | null> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/configuration`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as Partial<PaperclipAgentConfiguration>;
+    return {
+      id: String(raw.id ?? agentId),
+      companyId: String(raw.companyId ?? ''),
+      name: String(raw.name ?? ''),
+      role: raw.role ?? null,
+      title: raw.title ?? null,
+      status: raw.status ?? null,
+      reportsTo: raw.reportsTo ?? null,
+      adapterType: String(raw.adapterType ?? ''),
+      adapterConfig:
+        (raw.adapterConfig as Record<string, unknown> | undefined) ?? {},
+      runtimeConfig:
+        (raw.runtimeConfig as Record<string, unknown> | undefined) ?? {},
+      permissions: {
+        canCreateAgents: Boolean(raw.permissions?.canCreateAgents),
+        canAssignTasks: Boolean(raw.permissions?.canAssignTasks),
+      },
+      updatedAt: raw.updatedAt,
+    };
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentConfiguration failed:', err);
+    return null;
+  }
+}
+
+export interface PaperclipConfigRevision {
+  id: string;
+  companyId: string;
+  agentId: string;
+  createdByAgentId?: string | null;
+  createdByUserId?: string | null;
+  source: string;
+  rolledBackFromRevisionId?: string | null;
+  changedKeys: string[];
+  beforeConfig?: Record<string, unknown>;
+  afterConfig?: Record<string, unknown>;
+  createdAt: string;
+}
+
+export async function fetchAgentConfigRevisions(
+  agentId: string,
+): Promise<PaperclipConfigRevision[]> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/config-revisions`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipConfigRevision[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { revisions?: unknown };
+      if (Array.isArray(obj.revisions)) return obj.revisions as PaperclipConfigRevision[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentConfigRevisions failed:', err);
+    return [];
+  }
+}
+
+export async function rollbackAgentConfigRevision(
+  agentId: string,
+  revisionId: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/config-revisions/${encodeURIComponent(revisionId)}/rollback`;
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] rollbackAgentConfigRevision failed:', err);
+    return false;
+  }
+}
+
+export async function updateAgentPermissions(
+  agentId: string,
+  permissions: PaperclipAgentPermissions,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/permissions`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(permissions),
+    });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateAgentPermissions failed:', err);
+    return false;
+  }
+}
+
+// ── Agent instructions bundle ────────────────────────────────────
+//
+// Paperclip lets each agent carry a "bundle" of markdown files that
+// form its system prompt + knowledge. The most common shape is a
+// single `system.md` (the prompt) plus optional supporting docs the
+// agent can reference. Our v1 surface mirrors the dashboard's:
+// fetch the bundle's entry-file contents and PATCH it back.
+
+export interface PaperclipInstructionsBundle {
+  entryPath: string;
+  /** Raw markdown of the entry file (typically the system prompt). */
+  content: string;
+}
+
+export async function fetchAgentInstructions(
+  agentId: string,
+): Promise<PaperclipInstructionsBundle | null> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/instructions-bundle`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as Partial<PaperclipInstructionsBundle> & {
+      entryFile?: { path?: string; content?: string };
+      content?: string;
+      entryPath?: string;
+    };
+    // Backend may shape the response a few ways — accept the common forms.
+    const entryPath =
+      raw.entryPath ?? raw.entryFile?.path ?? 'system.md';
+    const content = raw.content ?? raw.entryFile?.content ?? '';
+    return { entryPath, content };
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentInstructions failed:', err);
+    return null;
+  }
+}
+
+/** Save the agent's entry-file markdown back to Paperclip. */
+export async function updateAgentInstructions(
+  agentId: string,
+  content: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/instructions-bundle`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateAgentInstructions failed:', err);
+    return false;
+  }
+}
+
+/** PATCH `/agents/:id` with partial config changes. */
+export async function updateAgent(
+  agentId: string,
+  patch: Partial<PaperclipAgentDetail>,
+): Promise<PaperclipAgentDetail | null> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipAgentDetail;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateAgent failed:', err);
+    return null;
+  }
+}
+
+// ── Agent creation (Session 3 — "+ agent" flow) ──────────────────
+//
+// Paperclip's self-create form posts to `/companies/:id/agent-hires`
+// (NOT `/agents`). The endpoint validates against `createAgentSchema`
+// which has 3 required fields (name, role, adapterType) and ~22
+// optional ones. We expose a narrow GoalsModal-friendly subset; the
+// operator can edit deeper fields via the AgentManagementModal after
+// the agent exists.
+//
+// The "ask CEO" path doesn't hit this endpoint at all — it just
+// creates a regular issue assigned to the CEO (caller's responsibility
+// to find the CEO and use `createIssue` directly).
+
+export const AGENT_ROLES = [
+  'ceo',
+  'cto',
+  'cmo',
+  'cfo',
+  'coo',
+  'engineer',
+  'designer',
+  'pm',
+  'qa',
+  'finance',
+  'operations',
+  'general',
+] as const;
+export type AgentRole = (typeof AGENT_ROLES)[number];
+
+// Adapter types Paperclip's backend accepts on POST /agent-hires.
+// Verified against `packages/shared/src/constants.ts AGENT_ADAPTER_TYPES`.
+// The backend rejects any other value with HTTP 422 ("Unknown adapter
+// type: ..."). Note the underscore + `_local` / `_cloud` suffixes —
+// they are NOT hyphenated like the UI labels suggest.
+export const AGENT_ADAPTER_TYPES = [
+  'claude_local',
+  'codex_local',
+  'cursor',
+  'cursor_cloud',
+  'gemini_local',
+  'grok_local',
+  'hermes_local',
+  'openclaw_gateway',
+  'opencode_local',
+  'pi_local',
+] as const;
+export type AgentAdapterType = (typeof AGENT_ADAPTER_TYPES)[number];
+
+export interface CreateAgentInput {
+  name: string;
+  role?: AgentRole;
+  title?: string | null;
+  icon?: string | null;
+  reportsTo?: string | null;
+  adapterType: AgentAdapterType | string;
+  adapterConfig?: Record<string, unknown>;
+  /**
+   * Top-level runtime knobs (heartbeat policy, max turns, etc.). Sent
+   * separately from adapterConfig so the backend can split per-adapter
+   * defaults from policy-level overrides.
+   */
+  runtimeConfig?: Record<string, unknown>;
+  capabilities?: string | null;
+  budgetMonthlyCents?: number;
+}
+
+export interface CreateAgentResult {
+  agent: PaperclipAgentDetail;
+  /** Some installs require admin approval — pending approval row, if any. */
+  approval?: unknown;
+}
+
+/** Create a new agent. Endpoint: `POST /companies/:id/agent-hires`. */
+export async function createAgentHire(
+  input: CreateAgentInput,
+): Promise<CreateAgentResult | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/agent-hires`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: input.name,
+        role: input.role ?? 'general',
+        title: input.title ?? null,
+        icon: input.icon ?? null,
+        reportsTo: input.reportsTo ?? null,
+        adapterType: input.adapterType,
+        adapterConfig: input.adapterConfig ?? {},
+        ...(input.runtimeConfig ? { runtimeConfig: input.runtimeConfig } : {}),
+        capabilities: input.capabilities ?? null,
+        budgetMonthlyCents: input.budgetMonthlyCents ?? 0,
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as CreateAgentResult;
+  } catch (err) {
+    console.warn('[PaperclipApi] createAgentHire failed:', err);
+    return null;
+  }
+}
+
+// ── Organizational hierarchy ─────────────────────────────────────
+//
+// Paperclip exposes `GET /companies/:id/org` which returns the agent
+// hierarchy as a pre-built recursive tree (walking `reportsTo`
+// server-side, so we don't have to do it ourselves). Each node has
+// the agent's identity + role + status, plus a `reports[]` array of
+// child OrgNodes.
+//
+// Note (Session 1.2 cleanup): the previously-exposed server-rendered
+// SVG/PNG exports (`/org.svg`, `/org.png`) were dropped from the UI
+// because the static image had no interactive value. Session 3 will
+// replace this list view with a proper visual hierarchy (boxes-and-
+// lines, drag-to-reparent).
+
+export interface OrgNode {
+  id: string;
+  name: string;
+  role?: string | null;
+  title?: string | null;
+  status?: string | null;
+  icon?: string | null;
+  reports: OrgNode[];
+}
+
+/** Fetch the company's hierarchy tree (recursive). Null on failure. */
+export async function fetchCompanyOrg(): Promise<OrgNode[] | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/org`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as unknown;
+    // Endpoint may return either an array of root nodes or a single root
+    // wrapped in { root: ... } — accept both.
+    if (Array.isArray(raw)) return raw as OrgNode[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { roots?: unknown; root?: unknown; tree?: unknown };
+      if (Array.isArray(obj.roots)) return obj.roots as OrgNode[];
+      if (Array.isArray(obj.tree)) return obj.tree as OrgNode[];
+      if (obj.root && typeof obj.root === 'object') return [obj.root as OrgNode];
+    }
+    return null;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanyOrg failed:', err);
+    return null;
+  }
+}
+
+/** Fetch one goal by id — used by the Goals modal's edit form. */
+export async function fetchGoalById(goalId: string): Promise<PaperclipGoal | null> {
+  const url = `${moduleBaseUrl}/api/goals/${encodeURIComponent(goalId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipGoal;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchGoalById failed:', err);
+    return null;
+  }
+}
+
+/** Create a goal. `title` and `level` are required by the backend. */
+export async function createGoal(input: GoalInput): Promise<PaperclipGoal | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/goals`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipGoal;
+  } catch (err) {
+    console.warn('[PaperclipApi] createGoal failed:', err);
+    return null;
+  }
+}
+
+/** Update a goal (partial). Endpoint: `PATCH /goals/:id`. */
+export async function updateGoal(
+  goalId: string,
+  patch: GoalInput,
+): Promise<PaperclipGoal | null> {
+  const url = `${moduleBaseUrl}/api/goals/${encodeURIComponent(goalId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipGoal;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateGoal failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Delete a goal. Backend returns 204 on success. Returns true on
+ * success, false on any error — callers refetch the list either way.
+ */
+export async function deleteGoal(goalId: string): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/goals/${encodeURIComponent(goalId)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteGoal failed:', err);
+    return false;
+  }
+}
+
+/** Fetch one project by id — used by the edit modal. */
+export async function fetchProjectById(
+  projectId: string,
+): Promise<PaperclipProject | null> {
+  const url = `${moduleBaseUrl}/api/projects/${encodeURIComponent(projectId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipProject;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchProjectById failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Set a lifetime budget cap on a project — upserts a `budget_policies`
+ * row scoped to the project. Endpoint: `POST /companies/:id/budgets/policies`.
+ * `amountCents` is the cap in cents.
+ *
+ * Note: reading the *current* cap / live spend lives in Paperclip's cost
+ * dashboard; this client only writes the cap.
+ */
+export async function setProjectBudget(
+  projectId: string,
+  amountCents: number,
+): Promise<boolean> {
+  if (!moduleCompanyId) return false;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/budgets/policies`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scopeType: 'project',
+        scopeId: projectId,
+        amount: amountCents,
+        windowKind: 'lifetime',
+      }),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return true;
+  } catch (err) {
+    console.warn('[PaperclipApi] setProjectBudget failed:', err);
+    return false;
+  }
+}
+
+/**
+ * A heartbeat run summary — only the fields the chat panel needs.
+ * Used to resolve which agent emitted a comment when `authorAgentId`
+ * is missing (local_trusted mode, no JWT injected) but `createdByRunId`
+ * is set. The run's `agentId` is the authoritative answer.
+ *
+ * `issueCommentSatisfiedByCommentId` is the comment the run *produced*
+ * (as opposed to merely processed). It is the disambiguator between two
+ * shapes that look identical from comment fields alone:
+ *   • a comment the AGENT produced but Paperclip stamped with
+ *     `authorType: 'user'` because no JWT was injected, and
+ *   • a comment the USER typed that happened to wake the run.
+ * If `run.issueCommentSatisfiedByCommentId === comment.id` the run
+ * produced it → it is agent content despite the `authorType`.
+ */
+export interface PaperclipHeartbeatRunRef {
+  id: string;
+  agentId: string;
+  issueId?: string | null;
+  issueCommentSatisfiedByCommentId?: string | null;
+}
+
+/** Fetch a single heartbeat run — used to back-fill agent attribution. */
+export async function fetchHeartbeatRun(
+  runId: string,
+): Promise<PaperclipHeartbeatRunRef | null> {
+  const url = `${moduleBaseUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as Partial<PaperclipHeartbeatRunRef> & {
+      id?: string;
+      agentId?: string;
+      issueCommentSatisfiedByCommentId?: string | null;
+    };
+    if (!raw.id || !raw.agentId) return null;
+    return {
+      id: raw.id,
+      agentId: raw.agentId,
+      issueId: raw.issueId ?? null,
+      issueCommentSatisfiedByCommentId:
+        raw.issueCommentSatisfiedByCommentId ?? null,
+    };
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchHeartbeatRun failed:', err);
+    return null;
+  }
+}
+
+/**
+ * List every issue an agent has *participated* in — Paperclip's
+ * `participantAgentId` filter returns issues where the agent is the
+ * assignee, creator, a comment author, OR an activity-log actor. This is
+ * the correct query for "which issue trees is this agent involved in",
+ * as opposed to `fetchAgentIssues` which only covers current assignment.
+ *
+ * `opts.projectId` adds a server-side `projectId` filter (the two combine
+ * with AND) — used by project bookmarks. The "no project" bookmark omits
+ * it and filters `projectId === null` client-side, since Paperclip has no
+ * null-project sentinel.
+ */
+export async function fetchParticipantIssues(
+  agentUuid: string,
+  opts?: { projectId?: string },
+): Promise<PaperclipIssue[]> {
+  if (!moduleCompanyId) return [];
+  let url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues?participantAgentId=${encodeURIComponent(agentUuid)}&limit=200`;
+  if (opts?.projectId) {
+    url += `&projectId=${encodeURIComponent(opts.projectId)}`;
+  }
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipIssue[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { issues?: unknown }).issues)) {
+      return (raw as { issues: PaperclipIssue[] }).issues;
+    }
+    console.warn('[PaperclipApi] unexpected issues response shape:', raw);
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchParticipantIssues failed:', err);
+    return [];
+  }
+}
+
+/**
+ * List every descendant of an issue — Paperclip's `descendantOf` filter
+ * walks the whole sub-tree in a single recursive-CTE query. Does NOT
+ * include the ancestor itself; callers merge that in separately.
+ */
+export async function fetchIssueDescendants(
+  rootIssueId: string,
+): Promise<PaperclipIssue[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues?descendantOf=${encodeURIComponent(rootIssueId)}&limit=500`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipIssue[];
+    if (raw && typeof raw === 'object' && Array.isArray((raw as { issues?: unknown }).issues)) {
+      return (raw as { issues: PaperclipIssue[] }).issues;
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchIssueDescendants failed:', err);
     return [];
   }
 }
@@ -990,6 +2156,17 @@ export async function updateIssueAssignee(
  * POV this is "open a new chat with X", not "fill an issue form".
  * The issue can always be renamed later in Paperclip's classic UI.
  */
+/**
+ * Paperclip distinguishes two issue work modes (column `workMode` on the
+ * issues table; first-class field, not metadata):
+ *   • "standard" — a regular executable task. Default for new issues.
+ *   • "planning" — a planning unit. The agent treats it as ideation
+ *      / decomposition work rather than direct execution.
+ * The createIssue endpoint accepts the value optionally; omitting it
+ * leaves the backend's default ("standard") in place.
+ */
+export type PaperclipIssueWorkMode = 'standard' | 'planning';
+
 export async function createIssue(args: {
   title: string;
   description?: string;
@@ -1000,6 +2177,10 @@ export async function createIssue(args: {
   priority?: string;
   /** Optional parent issue — used for sub-tasks under a plan. */
   parentId?: string | null;
+  /** Optional work mode. Server default is 'standard' when omitted. */
+  workMode?: PaperclipIssueWorkMode;
+  /** Optional goal this issue contributes to (single, nullable). */
+  goalId?: string | null;
 }): Promise<PaperclipIssue | null> {
   if (!moduleCompanyId) {
     console.warn('[PaperclipApi] createIssue called before company is known');
@@ -1017,6 +2198,8 @@ export async function createIssue(args: {
         status: args.status ?? 'todo',
         ...(args.priority ? { priority: args.priority } : {}),
         ...(args.parentId ? { parentId: args.parentId } : {}),
+        ...(args.workMode ? { workMode: args.workMode } : {}),
+        ...(args.goalId !== undefined ? { goalId: args.goalId } : {}),
       }),
     });
     if (!r.ok) {
@@ -1300,6 +2483,7 @@ export async function startPaperclipApi(
       case 'heartbeat.run.queued':
       case 'heartbeat.run.status': {
         const uuid = String(payload.agentId ?? '');
+        const runId = String(payload.runId ?? '');
         const runStatus = String(payload.status ?? 'running');
         if (!uuid) return;
         const numericId = idMapper.toNumeric(uuid);
@@ -1309,6 +2493,18 @@ export async function startPaperclipApi(
           id: numericId,
           status: terminal ? 'active' : 'active', // both map to 'active' until we add finer overlay
         });
+        // Fan out to the run-status subscription (used by the office's
+        // speech-bubble bridge for "user just woke me up" / "I'm now
+        // running" beats). For .queued events Paperclip doesn't send a
+        // `status` field — synthesize 'queued' to mark the distinction.
+        if (runId) {
+          emitRunStatus({
+            kind: event.type === 'heartbeat.run.queued' ? 'queued' : runStatus,
+            agentId: uuid,
+            runId,
+            createdAt: event.createdAt,
+          });
+        }
         return;
       }
 
