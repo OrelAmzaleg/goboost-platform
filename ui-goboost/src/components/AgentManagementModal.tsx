@@ -4,6 +4,7 @@ import {
   AGENT_ADAPTER_TYPES,
   AGENT_ROLES,
   cancelRun,
+  deleteInstructionsFile,
   fetchAgentById,
   fetchAgentConfigRevisions,
   fetchAgentConfiguration,
@@ -12,25 +13,36 @@ import {
   fetchAgentSkills,
   fetchBudgetOverview,
   fetchCompanyAgents,
+  fetchCompanySkills,
+  fetchInstructionsFile,
   fetchParticipantIssues,
+  fetchRunEvents,
+  fetchRunIssuesTouched,
   fetchRunLog,
+  fetchRunWorkspaceOperations,
   rollbackAgentConfigRevision,
+  saveInstructionsFile,
   subscribeActivity,
+  syncAgentSkills,
   updateAgent,
-  updateAgentInstructions,
   updateAgentPermissions,
   upsertBudgetPolicy,
   type AgentRole,
   type PaperclipAgentConfiguration,
   type PaperclipAgentDetail,
-  type PaperclipAgentSkill,
+  type PaperclipAgentSkillEntry,
+  type PaperclipAgentSkillSnapshot,
   type PaperclipAgentSummary,
   type PaperclipBudgetOverviewEntry,
+  type PaperclipCompanySkill,
   type PaperclipConfigRevision,
   type PaperclipHeartbeatRunSummary,
   type PaperclipInstructionsBundle,
   type PaperclipIssue,
+  type PaperclipRunEvent,
+  type PaperclipRunIssue,
   type PaperclipRunLogChunk,
+  type PaperclipWorkspaceOperation,
 } from '../paperclipApi.js';
 import { ModalShell, primaryBtn, secondaryBtn } from './ProjectCreateModal.js';
 import { TextArea, TextField } from './projectForm.js';
@@ -1145,156 +1157,528 @@ function RevisionRow({
 
 // ── Instructions tab ─────────────────────────────────────────────
 
+// Session 6: Instructions is a multi-file bundle. Layout = left
+// sidebar (file list with ★ entry-file badge + size + delete) | right
+// editor (selected file). New-file row at the bottom of the sidebar.
+// "Save" is per-file. Switching files prompts if dirty.
 function InstructionsTab({ agentUuid }: { agentUuid: string }) {
   const [bundle, setBundle] = useState<PaperclipInstructionsBundle | null>(
     null,
   );
+  const [activePath, setActivePath] = useState<string>('');
   const [content, setContent] = useState('');
-  const [loading, setLoading] = useState(true);
+  const [origContent, setOrigContent] = useState('');
+  const [loadingBundle, setLoadingBundle] = useState(true);
+  const [loadingFile, setLoadingFile] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [newPath, setNewPath] = useState('');
+
+  // ── Initial bundle load ─────────────────────────────────────
+  const reloadBundle = useCallback(async () => {
+    setLoadingBundle(true);
+    const b = await fetchAgentInstructions(agentUuid);
+    if (b) {
+      setBundle(b);
+      // Default-select the entry file the first time.
+      setActivePath((prev) => prev || b.entryPath);
+    } else {
+      setError('לא ניתן לטעון את חבילת ההוראות.');
+    }
+    setLoadingBundle(false);
+  }, [agentUuid]);
 
   useEffect(() => {
+    void reloadBundle();
+  }, [reloadBundle]);
+
+  // ── Load file content whenever active path changes ─────────
+  useEffect(() => {
+    if (!activePath) return;
     let cancelled = false;
-    setLoading(true);
-    void fetchAgentInstructions(agentUuid).then((b) => {
+    setLoadingFile(true);
+    setError(null);
+    void fetchInstructionsFile(agentUuid, activePath).then((f) => {
       if (cancelled) return;
-      if (b) {
-        setBundle(b);
-        setContent(b.content);
-        setError(null);
+      if (!f) {
+        setError(`לא ניתן לטעון את הקובץ ${activePath}.`);
+        setContent('');
+        setOrigContent('');
       } else {
-        setError('לא ניתן לטעון את ההוראות.');
+        setContent(f.content);
+        setOrigContent(f.content);
       }
-      setLoading(false);
+      setLoadingFile(false);
     });
     return () => {
       cancelled = true;
     };
-  }, [agentUuid]);
+  }, [agentUuid, activePath]);
 
-  const submit = async () => {
-    setSaving(true);
-    const ok = await updateAgentInstructions(agentUuid, content);
-    setSaving(false);
-    if (!ok) {
-      setError('שמירת ההוראות נכשלה.');
+  const dirty = content !== origContent;
+
+  const switchFile = (path: string) => {
+    if (path === activePath) return;
+    if (dirty && !window.confirm('יש שינויים שלא נשמרו. לעבור בכל זאת?')) {
       return;
     }
-    setError(null);
-    setSavedAt(Date.now());
-    setBundle((b) => (b ? { ...b, content } : b));
+    setActivePath(path);
   };
 
-  const dirty = bundle != null && bundle.content !== content;
+  const submit = async () => {
+    if (!activePath) return;
+    setSaving(true);
+    const ok = await saveInstructionsFile(agentUuid, activePath, content);
+    setSaving(false);
+    if (!ok) {
+      setError('שמירת הקובץ נכשלה.');
+      return;
+    }
+    setOrigContent(content);
+    setSavedAt(Date.now());
+    void reloadBundle();
+  };
+
+  const onAddFile = async () => {
+    const path = newPath.trim();
+    if (!path) return;
+    if (bundle?.files.some((f) => f.path === path)) {
+      window.alert('קובץ עם השם הזה כבר קיים בחבילה.');
+      return;
+    }
+    setSaving(true);
+    const ok = await saveInstructionsFile(agentUuid, path, '');
+    setSaving(false);
+    if (!ok) {
+      setError('יצירת הקובץ נכשלה.');
+      return;
+    }
+    setNewPath('');
+    await reloadBundle();
+    setActivePath(path);
+  };
+
+  const onDeleteFile = async (path: string) => {
+    if (path === bundle?.entryPath) {
+      window.alert('לא ניתן למחוק את קובץ הכניסה של החבילה.');
+      return;
+    }
+    if (!window.confirm(`למחוק את הקובץ "${path}"?`)) return;
+    setSaving(true);
+    const ok = await deleteInstructionsFile(agentUuid, path);
+    setSaving(false);
+    if (!ok) {
+      setError('מחיקת הקובץ נכשלה.');
+      return;
+    }
+    if (activePath === path) {
+      setActivePath(bundle?.entryPath ?? '');
+    }
+    await reloadBundle();
+  };
+
+  if (loadingBundle && !bundle) {
+    return (
+      <div style={{ fontSize: 13, color: '#94a3b8', padding: '20px 0' }}>
+        טוען חבילה…
+      </div>
+    );
+  }
+
+  const readOnly = bundle && !bundle.editable;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div
-        style={{
-          fontSize: 11,
-          color: '#94a3b8',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-        }}
-      >
-        <span>קובץ:</span>
-        <span
+      {/* Bundle metadata row */}
+      {bundle ? (
+        <div
           style={{
-            fontFamily:
-              "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
-            background: 'rgba(0,0,0,0.3)',
-            padding: '1px 6px',
-            borderRadius: 4,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            flexWrap: 'wrap',
+            fontSize: 11,
+            color: '#94a3b8',
           }}
         >
-          {bundle?.entryPath ?? '…'}
-        </span>
-      </div>
-      {loading ? (
-        <div style={{ fontSize: 13, color: '#94a3b8', padding: '20px 0' }}>
-          טוען הוראות…
+          {bundle.mode ? (
+            <span
+              style={{
+                background: 'rgba(99,102,241,0.22)',
+                color: '#c7d2fe',
+                padding: '1px 8px',
+                borderRadius: 999,
+                fontWeight: 700,
+              }}
+            >
+              mode: {bundle.mode}
+            </span>
+          ) : null}
+          {readOnly ? (
+            <span
+              style={{
+                background: 'rgba(245,158,11,0.22)',
+                color: '#fde68a',
+                padding: '1px 8px',
+                borderRadius: 999,
+                fontWeight: 700,
+              }}
+            >
+              קריאה בלבד
+            </span>
+          ) : null}
+          {bundle.rootPath ? (
+            <span
+              style={{
+                fontFamily:
+                  "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+                background: 'rgba(0,0,0,0.3)',
+                padding: '1px 6px',
+                borderRadius: 4,
+              }}
+              title={bundle.rootPath}
+            >
+              {bundle.rootPath}
+            </span>
+          ) : null}
+          {bundle.warnings.length > 0
+            ? bundle.warnings.map((w, i) => (
+                <span key={i} style={{ color: '#fca5a5' }}>
+                  ⚠ {w}
+                </span>
+              ))
+            : null}
         </div>
-      ) : (
-        <>
-          <textarea
-            value={content}
-            onChange={(e) => setContent(e.target.value)}
-            disabled={saving}
-            rows={18}
-            style={{
-              ...fieldStyle,
-              resize: 'vertical',
-              minHeight: 260,
-              fontFamily:
-                "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
-              fontSize: 12,
-              lineHeight: 1.5,
-            }}
-          />
-          {error ? (
+      ) : null}
+
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'minmax(180px, 240px) 1fr',
+          gap: 12,
+          alignItems: 'stretch',
+        }}
+      >
+        {/* Sidebar — files */}
+        <div
+          style={{
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRadius: 8,
+            padding: 8,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            minWidth: 0,
+          }}
+        >
+          {bundle?.files.map((f) => (
+            <InstructionsFileRow
+              key={f.path}
+              file={f}
+              active={f.path === activePath}
+              canDelete={!readOnly && !f.isEntry}
+              onSelect={() => switchFile(f.path)}
+              onDelete={() => void onDeleteFile(f.path)}
+            />
+          ))}
+          {!readOnly ? (
             <div
               style={{
-                fontSize: 12,
-                color: '#fecaca',
-                background: 'rgba(127,29,29,0.4)',
-                padding: '6px 10px',
-                borderRadius: 6,
+                display: 'flex',
+                gap: 4,
+                marginBlockStart: 6,
+                borderBlockStart: '1px solid rgba(255,255,255,0.08)',
+                paddingBlockStart: 6,
               }}
             >
-              {error}
+              <input
+                type="text"
+                value={newPath}
+                onChange={(e) => setNewPath(e.target.value)}
+                placeholder="path/to/file.md"
+                disabled={saving}
+                style={{
+                  ...fieldStyle,
+                  flex: 1,
+                  minWidth: 0,
+                  padding: '6px 8px',
+                  fontSize: 11,
+                  fontFamily:
+                    "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void onAddFile();
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => void onAddFile()}
+                disabled={saving || !newPath.trim()}
+                title="הוסף קובץ"
+                style={{
+                  padding: '6px 10px',
+                  borderRadius: 6,
+                  border: '1px solid rgba(34,197,94,0.55)',
+                  background: 'rgba(34,197,94,0.22)',
+                  color: '#dcfce7',
+                  cursor:
+                    saving || !newPath.trim() ? 'not-allowed' : 'pointer',
+                  fontSize: 13,
+                  fontFamily: 'inherit',
+                  fontWeight: 700,
+                  opacity: saving || !newPath.trim() ? 0.5 : 1,
+                  flexShrink: 0,
+                }}
+              >
+                +
+              </button>
             </div>
           ) : null}
+        </div>
+
+        {/* Editor — selected file */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div
             style={{
+              fontSize: 11,
+              color: '#94a3b8',
               display: 'flex',
-              gap: 8,
               alignItems: 'center',
-              justifyContent: 'flex-end',
+              gap: 6,
             }}
           >
-            {savedAt && Date.now() - savedAt < 4000 ? (
-              <span style={{ fontSize: 11, color: '#86efac' }}>נשמר ✓</span>
-            ) : null}
-            <button
-              type="button"
-              onClick={() => void submit()}
-              disabled={saving || !dirty}
+            <span>קובץ נבחר:</span>
+            <span
               style={{
-                ...primaryBtn,
-                opacity: saving || !dirty ? 0.5 : 1,
-                cursor: saving || !dirty ? 'not-allowed' : 'pointer',
+                fontFamily:
+                  "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+                background: 'rgba(0,0,0,0.3)',
+                padding: '1px 6px',
+                borderRadius: 4,
               }}
             >
-              {saving ? 'שומר…' : dirty ? 'שמור הוראות' : 'אין שינויים'}
-            </button>
+              {activePath || '—'}
+            </span>
+            {activePath === bundle?.entryPath ? (
+              <span
+                style={{
+                  fontSize: 10,
+                  color: '#fde68a',
+                  padding: '1px 6px',
+                  borderRadius: 999,
+                  background: 'rgba(245,158,11,0.18)',
+                  fontWeight: 700,
+                }}
+                title="קובץ כניסת החבילה"
+              >
+                ★ entry
+              </span>
+            ) : null}
           </div>
-        </>
-      )}
+          {loadingFile ? (
+            <div style={{ fontSize: 13, color: '#94a3b8', padding: '20px 0' }}>
+              טוען קובץ…
+            </div>
+          ) : (
+            <>
+              <textarea
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                disabled={saving || !!readOnly}
+                rows={18}
+                style={{
+                  ...fieldStyle,
+                  resize: 'vertical',
+                  minHeight: 320,
+                  fontFamily:
+                    "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                }}
+              />
+              {error ? (
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: '#fecaca',
+                    background: 'rgba(127,29,29,0.4)',
+                    padding: '6px 10px',
+                    borderRadius: 6,
+                  }}
+                >
+                  {error}
+                </div>
+              ) : null}
+              {!readOnly ? (
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'center',
+                    justifyContent: 'flex-end',
+                  }}
+                >
+                  {savedAt && Date.now() - savedAt < 4000 ? (
+                    <span style={{ fontSize: 11, color: '#86efac' }}>נשמר ✓</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => void submit()}
+                    disabled={saving || !dirty}
+                    style={{
+                      ...primaryBtn,
+                      opacity: saving || !dirty ? 0.5 : 1,
+                      cursor: saving || !dirty ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {saving ? 'שומר…' : dirty ? 'שמור קובץ' : 'אין שינויים'}
+                  </button>
+                </div>
+              ) : null}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InstructionsFileRow({
+  file,
+  active,
+  canDelete,
+  onSelect,
+  onDelete,
+}: {
+  file: { path: string; bytes?: number; isEntry?: boolean };
+  active: boolean;
+  canDelete: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      onClick={onSelect}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 6,
+        padding: '6px 8px',
+        background: active
+          ? 'rgba(99,102,241,0.22)'
+          : hover
+            ? 'rgba(255,255,255,0.06)'
+            : 'transparent',
+        border: `1px solid ${active ? 'rgba(99,102,241,0.55)' : 'transparent'}`,
+        borderRadius: 6,
+        cursor: 'pointer',
+        minWidth: 0,
+      }}
+    >
+      {file.isEntry ? (
+        <span style={{ color: '#fde68a', fontSize: 11 }} title="קובץ כניסה">
+          ★
+        </span>
+      ) : null}
+      <span
+        style={{
+          flex: 1,
+          minWidth: 0,
+          fontSize: 11,
+          fontFamily:
+            "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+          color: '#e2e8f0',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+        title={file.path}
+      >
+        {file.path}
+      </span>
+      {canDelete && hover ? (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          title="מחק קובץ"
+          aria-label="מחק קובץ"
+          style={{
+            width: 18,
+            height: 18,
+            padding: 0,
+            background: 'transparent',
+            border: 'none',
+            color: '#fca5a5',
+            cursor: 'pointer',
+            fontSize: 12,
+            lineHeight: 1,
+          }}
+        >
+          🗑
+        </button>
+      ) : null}
     </div>
   );
 }
 
 // ── Skills tab ───────────────────────────────────────────────────
 
+// Session 6: skills work on a snapshot model. The agent snapshot
+// reports every skill the adapter knows about (with state + origin),
+// plus the desiredSkills list. The company library is a separate
+// fetch — feeds the "+ add skill" picker for skills not yet in the
+// agent's entry list.
+
+const SKILL_STATE_COLOR: Record<string, string> = {
+  installed: '#22c55e',
+  configured: '#0ea5e9',
+  available: '#94a3b8',
+  external: '#a855f7',
+  stale: '#f59e0b',
+  missing: '#ef4444',
+};
+
+const SKILL_STATE_LABEL: Record<string, string> = {
+  installed: 'מותקן',
+  configured: 'מוגדר',
+  available: 'זמין',
+  external: 'חיצוני',
+  stale: 'מיושן',
+  missing: 'חסר',
+};
+
 function SkillsTab({ agentUuid }: { agentUuid: string }) {
-  const [skills, setSkills] = useState<PaperclipAgentSkill[] | null>(null);
+  const [snapshot, setSnapshot] = useState<PaperclipAgentSkillSnapshot | null>(
+    null,
+  );
+  const [companyLib, setCompanyLib] = useState<PaperclipCompanySkill[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [addKey, setAddKey] = useState('');
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    const [snap, lib] = await Promise.all([
+      fetchAgentSkills(agentUuid),
+      fetchCompanySkills(),
+    ]);
+    setSnapshot(snap);
+    setCompanyLib(lib);
+    setLoading(false);
+  }, [agentUuid]);
 
   useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    void fetchAgentSkills(agentUuid).then((s) => {
-      if (cancelled) return;
-      setSkills(s);
-      setLoading(false);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [agentUuid]);
+    void reload();
+  }, [reload]);
 
   if (loading) {
     return (
@@ -1303,93 +1687,318 @@ function SkillsTab({ agentUuid }: { agentUuid: string }) {
       </div>
     );
   }
-  if (!skills || skills.length === 0) {
+
+  if (!snapshot) {
     return (
-      <div style={{ fontSize: 13, color: '#94a3b8', padding: '20px 0' }}>
-        לסוכן הזה לא מותקנות מיומנויות.
+      <div style={{ fontSize: 13, color: '#fecaca', padding: '20px 0' }}>
+        לא ניתן לטעון את snapshot המיומנויות.
       </div>
     );
   }
+
+  if (!snapshot.supported) {
+    return (
+      <div
+        style={{
+          fontSize: 13,
+          color: '#94a3b8',
+          padding: 20,
+          background: 'rgba(255,255,255,0.04)',
+          border: '1px dashed rgba(255,255,255,0.12)',
+          borderRadius: 8,
+          textAlign: 'center',
+        }}
+      >
+        <div style={{ fontSize: 22, marginBlockEnd: 6 }}>🔒</div>
+        adapter <code>{snapshot.adapterType}</code> לא תומך במיומנויות.
+      </div>
+    );
+  }
+
+  // Company-library skills the operator could ADD (not already in the
+  // entry list as a desired skill).
+  const entryKeys = new Set(snapshot.entries.map((e) => e.key));
+  const addable = companyLib.filter((c) => c.key && !entryKeys.has(c.key));
+
+  const toggleDesired = async (key: string, next: boolean) => {
+    if (syncing) return;
+    setError(null);
+    const newDesired = next
+      ? Array.from(new Set([...snapshot.desiredSkills, key]))
+      : snapshot.desiredSkills.filter((k) => k !== key);
+    setSyncing(true);
+    const updated = await syncAgentSkills(agentUuid, newDesired);
+    setSyncing(false);
+    if (!updated) {
+      setError('סנכרון המיומנויות נכשל.');
+      return;
+    }
+    setSnapshot(updated);
+  };
+
+  const addCompanySkill = async () => {
+    const key = addKey.trim();
+    if (!key) return;
+    await toggleDesired(key, true);
+    setAddKey('');
+  };
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {skills.map((s) => (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div
+        style={{
+          fontSize: 11,
+          color: '#94a3b8',
+          display: 'flex',
+          gap: 8,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
+        <span
+          style={{
+            background: 'rgba(99,102,241,0.22)',
+            color: '#c7d2fe',
+            padding: '1px 8px',
+            borderRadius: 999,
+            fontWeight: 700,
+          }}
+        >
+          mode: {snapshot.mode}
+        </span>
+        <span>
+          {snapshot.desiredSkills.length} מיומנויות מבוקשות · {snapshot.entries.length}{' '}
+          ב-snapshot
+        </span>
+        {snapshot.warnings.map((w, i) => (
+          <span key={i} style={{ color: '#fca5a5' }}>
+            ⚠ {w}
+          </span>
+        ))}
+      </div>
+
+      {error ? (
         <div
-          key={s.id}
+          style={{
+            fontSize: 12,
+            color: '#fecaca',
+            background: 'rgba(127,29,29,0.4)',
+            padding: '6px 10px',
+            borderRadius: 6,
+          }}
+        >
+          {error}
+        </div>
+      ) : null}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {snapshot.entries.length === 0 ? (
+          <div
+            style={{ fontSize: 12, color: '#94a3b8', padding: '10px 0' }}
+          >
+            לסוכן הזה לא רשומות מיומנויות עדיין.
+          </div>
+        ) : (
+          snapshot.entries.map((e) => (
+            <SkillEntryRow
+              key={e.key}
+              entry={e}
+              syncing={syncing}
+              onToggle={(next) => void toggleDesired(e.key, next)}
+            />
+          ))
+        )}
+      </div>
+
+      {/* Add-from-library picker */}
+      {addable.length > 0 ? (
+        <div
           style={{
             display: 'flex',
-            alignItems: 'flex-start',
-            gap: 10,
-            padding: '8px 10px',
-            background: 'rgba(255,255,255,0.04)',
-            border: '1px solid rgba(255,255,255,0.08)',
-            borderRadius: 8,
+            gap: 6,
+            alignItems: 'center',
+            borderBlockStart: '1px solid rgba(255,255,255,0.08)',
+            paddingBlockStart: 10,
+          }}
+        >
+          <span style={{ fontSize: 11, color: '#94a3b8', flexShrink: 0 }}>
+            הוסף מהספרייה:
+          </span>
+          <select
+            value={addKey}
+            onChange={(e) => setAddKey(e.target.value)}
+            disabled={syncing}
+            style={{ ...fieldStyle, flex: 1, minWidth: 0 }}
+          >
+            <option value="" style={{ background: '#1e293b', color: '#f1f5f9' }}>
+              בחר מיומנות…
+            </option>
+            {addable.map((c) => (
+              <option
+                key={c.key}
+                value={c.key}
+                style={{ background: '#1e293b', color: '#f1f5f9' }}
+              >
+                {c.name ?? c.key}
+                {c.category ? ` · ${c.category}` : ''}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={() => void addCompanySkill()}
+            disabled={syncing || !addKey}
+            style={{
+              ...primaryBtn,
+              padding: '6px 12px',
+              fontSize: 12,
+              opacity: syncing || !addKey ? 0.5 : 1,
+              cursor: syncing || !addKey ? 'not-allowed' : 'pointer',
+              flexShrink: 0,
+            }}
+          >
+            הוסף
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SkillEntryRow({
+  entry,
+  syncing,
+  onToggle,
+}: {
+  entry: PaperclipAgentSkillEntry;
+  syncing: boolean;
+  onToggle: (next: boolean) => void;
+}) {
+  const stateColor = SKILL_STATE_COLOR[entry.state] ?? '#64748b';
+  const stateLabel = SKILL_STATE_LABEL[entry.state] ?? entry.state;
+  const disabled = syncing || entry.readOnly || entry.required;
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 10,
+        padding: '8px 10px',
+        background: 'rgba(255,255,255,0.04)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        borderRadius: 8,
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={entry.desired}
+        disabled={disabled}
+        onChange={(e) => onToggle(e.target.checked)}
+        title={
+          entry.required
+            ? 'מיומנות חובה — לא ניתן לבטל'
+            : entry.readOnly
+              ? 'מיומנות קריאה-בלבד'
+              : ''
+        }
+        style={{
+          width: 16,
+          height: 16,
+          accentColor: '#6366f1',
+          marginBlockStart: 3,
+          cursor: disabled ? 'not-allowed' : 'pointer',
+          flexShrink: 0,
+        }}
+      />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 13,
+            fontWeight: 600,
+            color: '#e2e8f0',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            flexWrap: 'wrap',
           }}
         >
           <span
             style={{
-              flexShrink: 0,
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              marginBlockStart: 7,
-              background:
-                s.syncStatus === 'error'
-                  ? '#ef4444'
-                  : s.syncStatus === 'stale'
-                    ? '#f59e0b'
-                    : '#22c55e',
+              fontFamily:
+                "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
             }}
-            title={s.syncStatus ?? 'ok'}
-          />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div
+          >
+            {entry.runtimeName ?? entry.key}
+          </span>
+          <span
+            style={{
+              fontSize: 10,
+              padding: '1px 6px',
+              borderRadius: 999,
+              background: `${stateColor}33`,
+              color: stateColor,
+              fontWeight: 700,
+            }}
+          >
+            {stateLabel}
+          </span>
+          {entry.required ? (
+            <span
               style={{
-                fontSize: 13,
-                fontWeight: 600,
-                color: '#e2e8f0',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
+                fontSize: 10,
+                padding: '1px 6px',
+                borderRadius: 999,
+                background: 'rgba(245,158,11,0.22)',
+                color: '#fde68a',
+                fontWeight: 700,
               }}
             >
-              <span>{s.name}</span>
-              {s.managed ? (
-                <span
-                  style={{
-                    fontSize: 10,
-                    padding: '1px 6px',
-                    borderRadius: 999,
-                    background: 'rgba(99,102,241,0.22)',
-                    color: '#c7d2fe',
-                  }}
-                >
-                  מנוהל
-                </span>
-              ) : null}
-            </div>
-            {s.description ? (
-              <div
-                style={{ fontSize: 11, color: '#94a3b8', marginBlockStart: 2 }}
-              >
-                {s.description}
-              </div>
-            ) : null}
-            {s.source ? (
-              <div
-                style={{
-                  fontSize: 10,
-                  color: '#64748b',
-                  marginBlockStart: 2,
-                  fontFamily:
-                    "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
-                }}
-              >
-                {s.source}
-              </div>
-            ) : null}
-          </div>
+              חובה
+            </span>
+          ) : null}
+          {entry.managed ? (
+            <span
+              style={{
+                fontSize: 10,
+                padding: '1px 6px',
+                borderRadius: 999,
+                background: 'rgba(99,102,241,0.22)',
+                color: '#c7d2fe',
+              }}
+            >
+              מנוהל
+            </span>
+          ) : null}
         </div>
-      ))}
+        {entry.originLabel ? (
+          <div
+            style={{ fontSize: 11, color: '#94a3b8', marginBlockStart: 2 }}
+          >
+            מקור: {entry.originLabel}
+          </div>
+        ) : null}
+        {entry.locationLabel ? (
+          <div
+            style={{
+              fontSize: 10,
+              color: '#64748b',
+              marginBlockStart: 2,
+              fontFamily:
+                "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+            }}
+            title={entry.sourcePath ?? entry.targetPath ?? ''}
+          >
+            {entry.locationLabel}
+          </div>
+        ) : null}
+        {entry.detail ? (
+          <div
+            style={{ fontSize: 11, color: '#94a3b8', marginBlockStart: 2 }}
+          >
+            {entry.detail}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -1582,9 +2191,386 @@ function RunRow({
               {cancelling ? 'מבטל…' : 'בטל ריצה'}
             </button>
           ) : null}
-          <RunLog runId={run.id} />
+          <RunSubPanels run={run} />
         </div>
       ) : null}
+    </div>
+  );
+}
+
+// ── Run sub-panels (Session 6.E) ─────────────────────────────
+//
+// Inside an expanded run we surface five views Paperclip's own UI
+// shows: Log (text stream), Events (typed lifecycle events), Issues
+// touched, Workspace operations, and an "Invocation" synthetic panel
+// that just pretty-prints the run summary fields. Each tab loads
+// lazily — switching to a tab fires its fetch the first time.
+
+type RunSubTab = 'log' | 'events' | 'issues' | 'workspace' | 'invocation';
+
+const RUN_SUBTAB_LABELS: Record<RunSubTab, string> = {
+  log: 'Log',
+  events: 'Events',
+  issues: 'Issues Touched',
+  workspace: 'Workspace',
+  invocation: 'Invocation',
+};
+
+const RUN_SUBTABS: RunSubTab[] = [
+  'log',
+  'events',
+  'issues',
+  'workspace',
+  'invocation',
+];
+
+function RunSubPanels({ run }: { run: PaperclipHeartbeatRunSummary }) {
+  const [tab, setTab] = useState<RunSubTab>('log');
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div
+        style={{
+          display: 'flex',
+          gap: 2,
+          borderBlockEnd: '1px solid rgba(255,255,255,0.08)',
+          paddingBlockEnd: 4,
+          flexWrap: 'wrap',
+        }}
+      >
+        {RUN_SUBTABS.map((id) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setTab(id)}
+            style={{
+              padding: '3px 8px',
+              borderRadius: 5,
+              border: 'none',
+              background: tab === id ? 'rgba(99,102,241,0.3)' : 'transparent',
+              color: tab === id ? '#e0e7ff' : '#94a3b8',
+              fontWeight: 700,
+              fontSize: 10,
+              fontFamily: 'inherit',
+              cursor: 'pointer',
+            }}
+          >
+            {RUN_SUBTAB_LABELS[id]}
+          </button>
+        ))}
+      </div>
+      {tab === 'log' ? (
+        <RunLog runId={run.id} />
+      ) : tab === 'events' ? (
+        <RunEventsPanel runId={run.id} />
+      ) : tab === 'issues' ? (
+        <RunIssuesPanel runId={run.id} />
+      ) : tab === 'workspace' ? (
+        <RunWorkspacePanel runId={run.id} />
+      ) : (
+        <RunInvocationPanel run={run} />
+      )}
+    </div>
+  );
+}
+
+function RunEventsPanel({ runId }: { runId: string }) {
+  const [events, setEvents] = useState<PaperclipRunEvent[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void fetchRunEvents(runId).then((e) => {
+      if (cancelled) return;
+      setEvents(e);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+  if (loading) return <RunSubLoadingHint>טוען events…</RunSubLoadingHint>;
+  if (!events || events.length === 0)
+    return <RunSubLoadingHint>אין events לריצה הזו.</RunSubLoadingHint>;
+  return (
+    <RunSubScroll>
+      {events.map((ev) => (
+        <div
+          key={ev.id}
+          style={{
+            display: 'flex',
+            gap: 8,
+            padding: '4px 0',
+            borderBlockEnd: '1px solid rgba(255,255,255,0.05)',
+            fontSize: 11,
+          }}
+        >
+          <span
+            style={{
+              color: '#64748b',
+              fontFamily:
+                "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+              flexShrink: 0,
+              width: 30,
+            }}
+          >
+            #{ev.seq}
+          </span>
+          <span
+            style={{
+              fontWeight: 700,
+              color: ev.color || '#cbd5e1',
+              flexShrink: 0,
+              minWidth: 90,
+            }}
+          >
+            {ev.eventType}
+          </span>
+          {ev.stream ? (
+            <span
+              style={{
+                color: '#94a3b8',
+                fontSize: 10,
+                padding: '0 4px',
+                borderRadius: 3,
+                background: 'rgba(255,255,255,0.06)',
+                flexShrink: 0,
+              }}
+            >
+              {ev.stream}
+            </span>
+          ) : null}
+          <span style={{ color: '#e2e8f0', flex: 1, minWidth: 0 }}>
+            {ev.message ?? ''}
+          </span>
+          <span
+            style={{ color: '#64748b', fontSize: 10, flexShrink: 0 }}
+            title={ev.createdAt}
+          >
+            {new Date(ev.createdAt).toLocaleTimeString('he-IL')}
+          </span>
+        </div>
+      ))}
+    </RunSubScroll>
+  );
+}
+
+function RunIssuesPanel({ runId }: { runId: string }) {
+  const [issues, setIssues] = useState<PaperclipRunIssue[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void fetchRunIssuesTouched(runId).then((r) => {
+      if (cancelled) return;
+      setIssues(r);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+  if (loading) return <RunSubLoadingHint>טוען issues…</RunSubLoadingHint>;
+  if (!issues || issues.length === 0)
+    return <RunSubLoadingHint>הריצה לא נגעה ב-issues.</RunSubLoadingHint>;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      {issues.map((iss) => (
+        <div
+          key={iss.issueId}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '6px 8px',
+            background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.06)',
+            borderRadius: 6,
+          }}
+        >
+          <span
+            style={{
+              fontSize: 10,
+              fontFamily:
+                "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace",
+              background: 'rgba(0,0,0,0.35)',
+              padding: '1px 6px',
+              borderRadius: 3,
+              color: '#cbd5e1',
+              flexShrink: 0,
+            }}
+          >
+            {iss.identifier ?? iss.issueId.slice(0, 8)}
+          </span>
+          <span
+            style={{
+              fontSize: 12,
+              color: '#e2e8f0',
+              flex: 1,
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+            title={iss.title}
+          >
+            {iss.title}
+          </span>
+          <span style={{ fontSize: 10, color: '#94a3b8', flexShrink: 0 }}>
+            {iss.status}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RunWorkspacePanel({ runId }: { runId: string }) {
+  const [ops, setOps] = useState<PaperclipWorkspaceOperation[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    void fetchRunWorkspaceOperations(runId).then((o) => {
+      if (cancelled) return;
+      setOps(o);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+  if (loading) return <RunSubLoadingHint>טוען workspace operations…</RunSubLoadingHint>;
+  if (!ops || ops.length === 0)
+    return (
+      <RunSubLoadingHint>אין workspace operations לריצה הזו.</RunSubLoadingHint>
+    );
+  return (
+    <RunSubScroll>
+      {ops.map((op) => (
+        <div
+          key={op.id}
+          style={{
+            display: 'flex',
+            gap: 8,
+            padding: '4px 0',
+            borderBlockEnd: '1px solid rgba(255,255,255,0.05)',
+            fontSize: 11,
+          }}
+        >
+          <span
+            style={{
+              fontWeight: 700,
+              color: '#cbd5e1',
+              flexShrink: 0,
+              minWidth: 110,
+            }}
+          >
+            {op.operation}
+          </span>
+          {op.status ? (
+            <span
+              style={{
+                fontSize: 10,
+                padding: '0 4px',
+                borderRadius: 3,
+                background: 'rgba(255,255,255,0.06)',
+                color: '#94a3b8',
+                flexShrink: 0,
+              }}
+            >
+              {op.status}
+            </span>
+          ) : null}
+          <span style={{ color: '#e2e8f0', flex: 1, minWidth: 0 }}>
+            {op.message ?? ''}
+          </span>
+          <span
+            style={{ color: '#64748b', fontSize: 10, flexShrink: 0 }}
+            title={op.createdAt}
+          >
+            {new Date(op.createdAt).toLocaleTimeString('he-IL')}
+          </span>
+        </div>
+      ))}
+    </RunSubScroll>
+  );
+}
+
+// Invocation — synthetic panel from the run summary. No new endpoint
+// because Paperclip's own UI sources this from the run row itself.
+function RunInvocationPanel({ run }: { run: PaperclipHeartbeatRunSummary }) {
+  const fields: { label: string; value: string }[] = [];
+  const push = (label: string, v: unknown) => {
+    if (v == null || v === '') return;
+    fields.push({ label, value: String(v) });
+  };
+  push('Run id', run.id);
+  push('Status', run.status);
+  push('Invocation source', run.invocationSource);
+  push('Trigger detail', run.triggerDetail);
+  push('Started', run.startedAt ? new Date(run.startedAt).toLocaleString('he-IL') : '');
+  push('Finished', run.finishedAt ? new Date(run.finishedAt).toLocaleString('he-IL') : '');
+  push('Model', run.model);
+  push('Provider', run.provider);
+  if (typeof run.inputTokens === 'number') push('Input tokens', run.inputTokens.toLocaleString());
+  if (typeof run.outputTokens === 'number') push('Output tokens', run.outputTokens.toLocaleString());
+  if (typeof run.costCents === 'number')
+    push('עלות', `$${(run.costCents / 100).toFixed(2)}`);
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'max-content 1fr',
+        gap: '4px 12px',
+        fontSize: 11,
+        padding: '6px 8px',
+        background: 'rgba(0,0,0,0.25)',
+        border: '1px solid rgba(255,255,255,0.06)',
+        borderRadius: 6,
+      }}
+    >
+      {fields.map((f) => (
+        <React.Fragment key={f.label}>
+          <span style={{ color: '#94a3b8' }}>{f.label}</span>
+          <span
+            style={{
+              color: '#e2e8f0',
+              fontFamily:
+                f.label === 'Run id'
+                  ? "'JetBrains Mono', ui-monospace, SFMono-Regular, monospace"
+                  : 'inherit',
+              fontSize: f.label === 'Run id' ? 10 : 11,
+            }}
+          >
+            {f.value}
+          </span>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function RunSubLoadingHint({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{ fontSize: 11, color: '#94a3b8', padding: '8px 0' }}>
+      {children}
+    </div>
+  );
+}
+
+function RunSubScroll({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        maxHeight: 260,
+        overflow: 'auto',
+        background: 'rgba(0,0,0,0.25)',
+        border: '1px solid rgba(255,255,255,0.06)',
+        borderRadius: 6,
+        padding: '4px 8px',
+      }}
+    >
+      {children}
     </div>
   );
 }

@@ -1321,36 +1321,154 @@ export async function upsertBudgetPolicy(
   }
 }
 
-// ── Agent skills ─────────────────────────────────────────────────
+// ── Agent skills (Session 6 — snapshot model) ───────────────────
+//
+// Paperclip's Skills tab works on a snapshot model: the GET endpoint
+// returns BOTH the desired-skills list (what the operator wants
+// enabled) and a full entry list (every skill the adapter knows
+// about, with state + origin metadata). The earlier "array of skill
+// objects" assumption returned empty for agents whose snapshot didn't
+// match that shape — fixed here.
+//
+// To toggle skills the operator POSTs `{ desiredSkills: [...] }` to
+// /skills/sync (full-set replacement, not incremental).
+//
+// Separately, the company-wide skills library is fetched from
+// /companies/:id/skills — used to populate the "add skill" picker.
 
-export interface PaperclipAgentSkill {
-  id: string;
-  name: string;
-  description?: string | null;
-  /** True when the skill is read-only / managed by the platform. */
-  managed?: boolean;
-  /** Last sync status from Paperclip — e.g. "ok", "stale", "error". */
-  syncStatus?: string | null;
-  /** Optional source identifier (file path or package name). */
-  source?: string | null;
+export type PaperclipSkillState =
+  | 'available'
+  | 'configured'
+  | 'installed'
+  | 'missing'
+  | 'stale'
+  | 'external';
+
+export type PaperclipSkillOrigin =
+  | 'company_managed'
+  | 'paperclip_required'
+  | 'user_installed'
+  | 'external_unknown';
+
+export interface PaperclipAgentSkillEntry {
+  key: string;
+  runtimeName?: string | null;
+  desired: boolean;
+  managed: boolean;
+  required?: boolean;
+  state: PaperclipSkillState | string;
+  origin: PaperclipSkillOrigin | string;
+  originLabel?: string | null;
+  locationLabel?: string | null;
+  readOnly?: boolean;
+  sourcePath?: string | null;
+  targetPath?: string | null;
+  detail?: string | null;
+}
+
+export interface PaperclipAgentSkillSnapshot {
+  adapterType: string;
+  supported: boolean;
+  mode: 'unsupported' | 'persistent' | 'ephemeral' | string;
+  desiredSkills: string[];
+  entries: PaperclipAgentSkillEntry[];
+  warnings: string[];
 }
 
 export async function fetchAgentSkills(
   agentId: string,
-): Promise<PaperclipAgentSkill[]> {
+): Promise<PaperclipAgentSkillSnapshot | null> {
   const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/skills`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as Record<string, unknown>;
+    const entriesRaw = Array.isArray(raw.entries)
+      ? (raw.entries as Record<string, unknown>[])
+      : [];
+    return {
+      adapterType: String(raw.adapterType ?? ''),
+      supported: Boolean(raw.supported ?? false),
+      mode: String(raw.mode ?? 'unsupported'),
+      desiredSkills: Array.isArray(raw.desiredSkills)
+        ? (raw.desiredSkills as string[])
+        : [],
+      entries: entriesRaw.map((e) => ({
+        key: String(e.key ?? ''),
+        runtimeName: (e.runtimeName as string | null | undefined) ?? null,
+        desired: Boolean(e.desired),
+        managed: Boolean(e.managed),
+        required: Boolean(e.required),
+        state: String(e.state ?? 'available'),
+        origin: String(e.origin ?? 'external_unknown'),
+        originLabel: (e.originLabel as string | null | undefined) ?? null,
+        locationLabel: (e.locationLabel as string | null | undefined) ?? null,
+        readOnly: Boolean(e.readOnly),
+        sourcePath: (e.sourcePath as string | null | undefined) ?? null,
+        targetPath: (e.targetPath as string | null | undefined) ?? null,
+        detail: (e.detail as string | null | undefined) ?? null,
+      })),
+      warnings: Array.isArray(raw.warnings) ? (raw.warnings as string[]) : [],
+    };
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchAgentSkills failed:', err);
+    return null;
+  }
+}
+
+/** Replace the agent's desiredSkills set (full list, not incremental). */
+export async function syncAgentSkills(
+  agentId: string,
+  desiredSkills: string[],
+): Promise<PaperclipAgentSkillSnapshot | null> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/skills/sync`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ desiredSkills }),
+    });
+    if (!r.ok) return null;
+    const raw = (await r.json()) as Record<string, unknown>;
+    return fetchAgentSkills(agentId).then(
+      (snap) => snap ?? (raw as unknown as PaperclipAgentSkillSnapshot),
+    );
+  } catch (err) {
+    console.warn('[PaperclipApi] syncAgentSkills failed:', err);
+    return null;
+  }
+}
+
+// Company-wide skills library — populates the "+ skill" picker so
+// the operator can add a skill the agent doesn't yet have. Shape is
+// looser since this is the library, not a per-agent snapshot.
+export interface PaperclipCompanySkill {
+  key: string;
+  name?: string | null;
+  description?: string | null;
+  managed?: boolean;
+  category?: string | null;
+}
+
+export async function fetchCompanySkills(): Promise<PaperclipCompanySkill[]> {
+  if (!moduleCompanyId) return [];
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/skills`;
   try {
     const r = await fetch(url);
     if (!r.ok) return [];
     const raw = (await r.json()) as unknown;
-    if (Array.isArray(raw)) return raw as PaperclipAgentSkill[];
-    if (raw && typeof raw === 'object') {
-      const obj = raw as { skills?: unknown };
-      if (Array.isArray(obj.skills)) return obj.skills as PaperclipAgentSkill[];
-    }
-    return [];
+    const arr = Array.isArray(raw)
+      ? raw
+      : ((raw as { skills?: unknown[] })?.skills ?? []);
+    return (arr as Record<string, unknown>[]).map((s) => ({
+      key: String(s.key ?? s.id ?? ''),
+      name: (s.name as string | null | undefined) ?? null,
+      description: (s.description as string | null | undefined) ?? null,
+      managed: Boolean(s.managed),
+      category: (s.category as string | null | undefined) ?? null,
+    }));
   } catch (err) {
-    console.warn('[PaperclipApi] fetchAgentSkills failed:', err);
+    console.warn('[PaperclipApi] fetchCompanySkills failed:', err);
     return [];
   }
 }
@@ -1419,6 +1537,106 @@ export async function fetchRunLog(
     return [];
   } catch (err) {
     console.warn('[PaperclipApi] fetchRunLog failed:', err);
+    return [];
+  }
+}
+
+// ── Run drill-down (Session 6 — Events / Issues / Workspace) ────
+//
+// Paperclip's Runs tab opens a per-run drawer with multiple sub-panels.
+// We already had Log; these are the rest.
+
+export interface PaperclipRunEvent {
+  id: string;
+  seq: number;
+  eventType: string;
+  stream?: 'system' | 'stdout' | 'stderr' | string | null;
+  level?: string | null;
+  color?: string | null;
+  message?: string | null;
+  payload?: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export async function fetchRunEvents(
+  runId: string,
+  opts: { afterSeq?: number; limit?: number } = {},
+): Promise<PaperclipRunEvent[]> {
+  const params = new URLSearchParams();
+  if (opts.afterSeq != null) params.set('afterSeq', String(opts.afterSeq));
+  params.set('limit', String(opts.limit ?? 200));
+  const url = `${moduleBaseUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}/events?${params}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipRunEvent[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { events?: unknown };
+      if (Array.isArray(obj.events)) return obj.events as PaperclipRunEvent[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRunEvents failed:', err);
+    return [];
+  }
+}
+
+export interface PaperclipRunIssue {
+  issueId: string;
+  identifier?: string | null;
+  title: string;
+  status: string;
+  priority?: string | null;
+}
+
+export async function fetchRunIssuesTouched(
+  runId: string,
+): Promise<PaperclipRunIssue[]> {
+  const url = `${moduleBaseUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}/issues`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipRunIssue[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { issues?: unknown };
+      if (Array.isArray(obj.issues)) return obj.issues as PaperclipRunIssue[];
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRunIssuesTouched failed:', err);
+    return [];
+  }
+}
+
+export interface PaperclipWorkspaceOperation {
+  id: string;
+  operation: string;
+  status?: string | null;
+  message?: string | null;
+  createdAt: string;
+  payload?: Record<string, unknown> | null;
+}
+
+export async function fetchRunWorkspaceOperations(
+  runId: string,
+): Promise<PaperclipWorkspaceOperation[]> {
+  const url = `${moduleBaseUrl}/api/heartbeat-runs/${encodeURIComponent(runId)}/workspace-operations`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const raw = (await r.json()) as unknown;
+    if (Array.isArray(raw)) return raw as PaperclipWorkspaceOperation[];
+    if (raw && typeof raw === 'object') {
+      const obj = raw as { operations?: unknown };
+      if (Array.isArray(obj.operations)) {
+        return obj.operations as PaperclipWorkspaceOperation[];
+      }
+    }
+    return [];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchRunWorkspaceOperations failed:', err);
     return [];
   }
 }
@@ -1570,18 +1788,80 @@ export async function updateAgentPermissions(
   }
 }
 
-// ── Agent instructions bundle ────────────────────────────────────
+// ── Agent instructions bundle (Session 6 — multi-file) ──────────
 //
-// Paperclip lets each agent carry a "bundle" of markdown files that
-// form its system prompt + knowledge. The most common shape is a
-// single `system.md` (the prompt) plus optional supporting docs the
-// agent can reference. Our v1 surface mirrors the dashboard's:
-// fetch the bundle's entry-file contents and PATCH it back.
+// Paperclip's Instructions tab is a multi-file bundle, not a single
+// document. The bundle has an `entryFile` (the primary prompt — like
+// `system.md`) and any number of sibling files (knowledge base
+// attachments the agent can reference). UI shows a file tree + an
+// editor pane for the selected file.
+//
+// Endpoints:
+//   GET    /agents/:id/instructions-bundle         → bundle + files[]
+//   PATCH  /agents/:id/instructions-bundle         → bundle metadata
+//   GET    /agents/:id/instructions-bundle/file?path=… → single file
+//   PUT    /agents/:id/instructions-bundle/file    → upsert file
+//   DELETE /agents/:id/instructions-bundle/file?path=… → remove file
+
+export interface PaperclipInstructionsFile {
+  path: string;
+  bytes?: number;
+  updatedAt?: string;
+  /** True when the entry-file is this one (drives the "★" badge). */
+  isEntry?: boolean;
+}
 
 export interface PaperclipInstructionsBundle {
+  agentId: string;
+  mode?: 'managed' | 'external' | string;
+  rootPath?: string | null;
+  managedRootPath?: string | null;
+  /** Path of the primary file (often `system.md` or `AGENTS.md`). */
   entryPath: string;
-  /** Raw markdown of the entry file (typically the system prompt). */
-  content: string;
+  /** Resolved absolute path on disk — useful for "open in editor" hints. */
+  resolvedEntryPath?: string | null;
+  /** True when the operator can edit (false for read-only managed bundles). */
+  editable: boolean;
+  warnings: string[];
+  files: PaperclipInstructionsFile[];
+}
+
+function normalizeBundle(
+  agentId: string,
+  raw: Record<string, unknown>,
+): PaperclipInstructionsBundle {
+  const entryFile = (raw.entryFile as Record<string, unknown> | undefined) ?? {};
+  const entryPath = String(
+    (entryFile.path as string | undefined) ??
+      (raw.entryPath as string | undefined) ??
+      'system.md',
+  );
+  const filesRaw = Array.isArray(raw.files) ? (raw.files as unknown[]) : [];
+  const files: PaperclipInstructionsFile[] = filesRaw
+    .map((f) => f as Record<string, unknown>)
+    .map((f) => ({
+      path: String(f.path ?? ''),
+      bytes: typeof f.bytes === 'number' ? f.bytes : undefined,
+      updatedAt: typeof f.updatedAt === 'string' ? f.updatedAt : undefined,
+      isEntry: String(f.path ?? '') === entryPath,
+    }))
+    .filter((f) => f.path.length > 0);
+  // Ensure entry-file is in the list even if the backend omitted it.
+  if (!files.some((f) => f.path === entryPath)) {
+    files.unshift({ path: entryPath, isEntry: true });
+  }
+  return {
+    agentId,
+    mode: (raw.mode as string | undefined) ?? undefined,
+    rootPath: (raw.rootPath as string | undefined) ?? null,
+    managedRootPath: (raw.managedRootPath as string | undefined) ?? null,
+    entryPath,
+    resolvedEntryPath:
+      (raw.resolvedEntryPath as string | undefined) ?? null,
+    editable: raw.editable !== false,
+    warnings: Array.isArray(raw.warnings) ? (raw.warnings as string[]) : [],
+    files,
+  };
 }
 
 export async function fetchAgentInstructions(
@@ -1591,39 +1871,81 @@ export async function fetchAgentInstructions(
   try {
     const r = await fetch(url);
     if (!r.ok) return null;
-    const raw = (await r.json()) as Partial<PaperclipInstructionsBundle> & {
-      entryFile?: { path?: string; content?: string };
-      content?: string;
-      entryPath?: string;
-    };
-    // Backend may shape the response a few ways — accept the common forms.
-    const entryPath =
-      raw.entryPath ?? raw.entryFile?.path ?? 'system.md';
-    const content = raw.content ?? raw.entryFile?.content ?? '';
-    return { entryPath, content };
+    const raw = (await r.json()) as Record<string, unknown>;
+    return normalizeBundle(agentId, raw);
   } catch (err) {
     console.warn('[PaperclipApi] fetchAgentInstructions failed:', err);
     return null;
   }
 }
 
-/** Save the agent's entry-file markdown back to Paperclip. */
+/** Fetch a single file's content from the bundle. */
+export async function fetchInstructionsFile(
+  agentId: string,
+  path: string,
+): Promise<{ path: string; content: string } | null> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/instructions-bundle/file?path=${encodeURIComponent(path)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const raw = (await r.json()) as { path?: string; content?: string };
+    return {
+      path: String(raw.path ?? path),
+      content: String(raw.content ?? ''),
+    };
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchInstructionsFile failed:', err);
+    return null;
+  }
+}
+
+/** Upsert a file's content (PUT). Used by the editor's Save button. */
+export async function saveInstructionsFile(
+  agentId: string,
+  path: string,
+  content: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/instructions-bundle/file`;
+  try {
+    const r = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, content }),
+    });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] saveInstructionsFile failed:', err);
+    return false;
+  }
+}
+
+export async function deleteInstructionsFile(
+  agentId: string,
+  path: string,
+): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/instructions-bundle/file?path=${encodeURIComponent(path)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteInstructionsFile failed:', err);
+    return false;
+  }
+}
+
+/**
+ * Back-compat for the single-file save the old InstructionsTab used.
+ * New callers should prefer `saveInstructionsFile(agentId, path, content)`
+ * since the bundle is multi-file. Kept as a thin alias that resolves
+ * the entry-file path from the bundle first.
+ */
 export async function updateAgentInstructions(
   agentId: string,
   content: string,
 ): Promise<boolean> {
-  const url = `${moduleBaseUrl}/api/agents/${encodeURIComponent(agentId)}/instructions-bundle`;
-  try {
-    const r = await fetch(url, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content }),
-    });
-    return r.ok;
-  } catch (err) {
-    console.warn('[PaperclipApi] updateAgentInstructions failed:', err);
-    return false;
-  }
+  const bundle = await fetchAgentInstructions(agentId);
+  if (!bundle) return false;
+  return saveInstructionsFile(agentId, bundle.entryPath, content);
 }
 
 /** PATCH `/agents/:id` with partial config changes. */
