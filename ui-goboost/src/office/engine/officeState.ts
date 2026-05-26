@@ -328,6 +328,27 @@ export class OfficeState {
     this.characters.set(id, ch);
   }
 
+  /**
+   * Wipe ALL characters + sub-agents without the despawn animation.
+   * Used by the workspace switcher when changing companies — the
+   * agents from the previous company are no longer ours, the new
+   * bootstrap will repopulate. Skips matrix effect so the switch
+   * feels instant.
+   */
+  clearAgents(): void {
+    this.characters.clear();
+    this.subagentIdMap.clear();
+    this.subagentMeta.clear();
+    this.selectedAgentId = null;
+    this.cameraFollowId = null;
+    this.hoveredAgentId = null;
+    for (const seat of this.seats.values()) {
+      seat.assigned = false;
+    }
+    // Rebuild furniture so "auto-on" desks reset to off.
+    this.rebuildFurnitureInstances();
+  }
+
   removeAgent(id: number): void {
     const ch = this.characters.get(id);
     if (!ch) return;
@@ -814,6 +835,48 @@ export class OfficeState {
 
   getCharacters(): Character[] {
     return Array.from(this.characters.values());
+  }
+
+  /**
+   * Session 9.3: project-scope visibility. App computes which agents
+   * are "involved" in the active scope and calls this with each agent
+   * id + a boolean. The engine tick lerps `displayAlpha` toward
+   * `targetAlpha` over ~500ms — see `ALPHA_LERP_PER_SECOND` in
+   * characters.ts. Idempotent — no-op when the target matches.
+   */
+  setAgentVisibility(numericId: number, visible: boolean): void {
+    const ch = this.characters.get(numericId);
+    if (!ch) return;
+    const target = visible ? 1 : 0;
+    if (ch.targetAlpha === target) return;
+    ch.targetAlpha = target;
+  }
+
+  /**
+   * Bulk variant — used when scope changes and we want to update
+   * every known agent in one pass. `visibleIds` is the set that
+   * should be visible; anything else gets faded out. Skips sub-agents
+   * (they belong to their parent's life-cycle, not to the scope).
+   */
+  applyVisibilityFromSet(visibleIds: Set<number>): void {
+    for (const ch of this.characters.values()) {
+      if (ch.isSubagent) continue;
+      const target = visibleIds.has(ch.id) ? 1 : 0;
+      if (ch.targetAlpha !== target) {
+        ch.targetAlpha = target;
+      }
+    }
+  }
+
+  /**
+   * Reset all visibility to fully-shown. Called when the scope is
+   * "dashboard" (show everything) or when we want to clear any
+   * lingering scope filter.
+   */
+  clearAgentVisibility(): void {
+    for (const ch of this.characters.values()) {
+      if (ch.targetAlpha !== 1) ch.targetAlpha = 1;
+    }
   }
 
   /** Get character at pixel position (for hit testing). Returns id or null. */

@@ -277,6 +277,9 @@ export function AgentActionToolbar({
   if (targetId == null || !ch || !agentUuid) return null;
   if (ch.isSubagent) return null;
   if (ch.matrixEffect === 'despawn') return null;
+  // Session 9.3: scope filter faded this agent out — no toolbar.
+  // Threshold matches the sprite-drop cutoff in renderer.ts.
+  if (ch.displayAlpha <= 0.02) return null;
 
   const el = containerRef.current;
   if (!el) return null;

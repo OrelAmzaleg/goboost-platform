@@ -127,6 +127,9 @@ export function ToolOverlay({
         // Only show for hovered or selected agents (unless always-show is on)
         if (!alwaysShowOverlay && !isSelected && !isHovered) return null;
 
+        // Session 9.3: scope filter faded this character out — hide.
+        if (ch.displayAlpha <= 0.02) return null;
+
         // Position above character
         const sittingOffset = ch.state === CharacterState.TYPE ? CHARACTER_SITTING_OFFSET_PX : 0;
         const screenX = (deviceOffsetX + ch.x * zoom) / dpr;

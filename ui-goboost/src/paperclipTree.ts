@@ -132,16 +132,24 @@ export async function buildAgentForest(
     return buildIssueScopedForest(agentUuid, scope.issueId);
   }
 
-  // general / project — gather the participant set, then build forests.
+  // dashboard / general / project — gather the participant set, then
+  // build forests.
   let participants: PaperclipIssue[];
   if (scope.kind === 'project') {
     participants = await fetchParticipantIssues(agentUuid, {
       projectId: scope.projectId,
     });
-  } else {
-    // general — no null-project sentinel exists; filter client-side.
+  } else if (scope.kind === 'general') {
+    // general — no null-project sentinel exists server-side; filter
+    // client-side after the unscoped fetch.
     const all = await fetchParticipantIssues(agentUuid);
     participants = all.filter((p) => p.projectId == null);
+  } else {
+    // dashboard — every issue the agent participates in, regardless
+    // of project. The "show everything" view (Session 9.2). Agent-
+    // level filtering (hide agents with zero project involvement) is
+    // a 9.3 concern; here we just return ALL the agent's forests.
+    participants = await fetchParticipantIssues(agentUuid);
   }
   if (participants.length === 0) return [];
 

@@ -147,6 +147,14 @@ export function renderScene(
 
   // Characters
   for (const ch of characters) {
+    // Session 9.3: scope-filter visibility. Fully-faded characters
+    // (alpha ≤ ~0.02) are dropped from the draw list entirely so they
+    // don't even cost a globalAlpha set/restore. The engine's lerp
+    // toward `targetAlpha` runs in the update tick; here we just
+    // respect the current displayAlpha.
+    const charAlpha = ch.displayAlpha;
+    if (charAlpha <= 0.02) continue;
+
     const sprites = getCharacterSprites(ch.palette, ch.hueShift);
     const spriteData = getCharacterSprite(ch, sprites);
     const cached = getCachedSprite(spriteData, zoom);
@@ -176,11 +184,15 @@ export function renderScene(
       continue;
     }
 
-    // White outline: full opacity for selected, 50% for hover
+    // White outline: full opacity for selected, 50% for hover.
+    // Outline alpha is composed with the character's visibility
+    // (charAlpha) so a faded-out agent's outline also fades.
     const isSelected = selectedAgentId !== null && ch.id === selectedAgentId;
     const isHovered = hoveredAgentId !== null && ch.id === hoveredAgentId;
     if (isSelected || isHovered) {
-      const outlineAlpha = isSelected ? SELECTED_OUTLINE_ALPHA : HOVERED_OUTLINE_ALPHA;
+      const outlineAlpha =
+        (isSelected ? SELECTED_OUTLINE_ALPHA : HOVERED_OUTLINE_ALPHA) *
+        charAlpha;
       const outlineData = getOutlineSprite(spriteData);
       const outlineCached = getCachedSprite(outlineData, zoom);
       const olDrawX = drawX - zoom; // 1 sprite-pixel offset, scaled
@@ -199,7 +211,14 @@ export function renderScene(
     drawables.push({
       zY: charZY,
       draw: (c) => {
-        c.drawImage(cached, drawX, drawY);
+        if (charAlpha < 1) {
+          c.save();
+          c.globalAlpha = charAlpha;
+          c.drawImage(cached, drawX, drawY);
+          c.restore();
+        } else {
+          c.drawImage(cached, drawX, drawY);
+        }
       },
     });
   }

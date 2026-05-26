@@ -87,8 +87,20 @@ export function createCharacter(
     inputTokens: 0,
     outputTokens: 0,
     speechBubble: null,
+    // Session 9.3: visibility defaults to fully visible. The
+    // project-scope filter mutates targetAlpha; the engine tick lerps
+    // displayAlpha toward it for the noticeable fade-in/out.
+    targetAlpha: 1,
+    displayAlpha: 1,
   };
 }
+
+// Session 9.3: visibility-fade speed. The rate is α-units-per-second;
+// a value of 2 means a full 0→1 transition takes ~500ms — slow
+// enough to register as a deliberate visual event (per the
+// "transitions must be noticeable, not subtle" rule), fast enough
+// not to feel laggy.
+const ALPHA_LERP_PER_SECOND = 2.5;
 
 export function updateCharacter(
   ch: Character,
@@ -99,6 +111,18 @@ export function updateCharacter(
   blockedTiles: Set<string>,
 ): void {
   ch.frameTimer += dt;
+
+  // Visibility fade — always running, near-zero cost when already at
+  // target. Lerps linearly toward `targetAlpha` so the human eye
+  // perceives a smooth fade in/out, not a snap.
+  if (ch.displayAlpha !== ch.targetAlpha) {
+    const step = ALPHA_LERP_PER_SECOND * dt;
+    if (ch.displayAlpha < ch.targetAlpha) {
+      ch.displayAlpha = Math.min(ch.targetAlpha, ch.displayAlpha + step);
+    } else {
+      ch.displayAlpha = Math.max(ch.targetAlpha, ch.displayAlpha - step);
+    }
+  }
 
   switch (ch.state) {
     case CharacterState.TYPE: {

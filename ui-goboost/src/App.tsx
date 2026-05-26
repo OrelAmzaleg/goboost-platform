@@ -1,26 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  activeScopeOf,
-  availableProjects,
-  GENERAL_BOOKMARK_ID,
-  issueBookmarkId,
+  activeChatScope,
+  activeScopeBookmarks,
+  autoPinRootIssue,
+  getScopeArrangement,
   loadArrangement,
-  projectBookmarkId,
-  reconcileBookmarks,
+  pinIssue as pinIssueInArrangement,
+  reorderPins,
   saveArrangement,
   seedArrangement,
+  setActivePin,
+  setActiveScope,
+  unpinIssue,
   type BookmarkArrangement,
+  type ProjectScope,
 } from './bookmarks.js';
 import { toMajorMinor } from './changelogData.js';
 import { BookmarksBar } from './components/BookmarksBar.js';
 import { AgentManagementModal } from './components/AgentManagementModal.js';
 import { AssignTaskModal } from './components/AssignTaskModal.js';
+import { CompanyOnboardingWizard } from './components/CompanyOnboardingWizard.js';
+import { CompanySettingsModal } from './components/CompanySettingsModal.js';
 import { GoalsModal } from './components/GoalsModal.js';
 import { OrgChartModal } from './components/OrgChartModal.js';
 import { RoutinesModal } from './components/RoutinesModal.js';
+import { WorkspaceSwitcher } from './components/WorkspaceSwitcher.js';
 import { BottomToolbar } from './components/BottomToolbar.js';
-import { ProjectAddModal } from './components/ProjectAddModal.js';
 import { ProjectCreateModal } from './components/ProjectCreateModal.js';
 import { ProjectEditModal } from './components/ProjectEditModal.js';
 import { WhatsAppPanel } from './components/WhatsAppPanel.js';
@@ -39,6 +45,7 @@ import { useExtensionMessages } from './hooks/useExtensionMessages.js';
 import { startAgentSpeechBridge } from './office/agentSpeechBridge.js';
 import { OfficeCanvas } from './office/components/OfficeCanvas.js';
 import { AgentActionToolbar } from './office/components/AgentActionToolbar.js';
+import { AgentStatusBadges } from './office/components/AgentStatusBadges.js';
 import { ToolOverlay } from './office/components/ToolOverlay.js';
 import { EditorState } from './office/editor/editorState.js';
 import { EditorToolbar } from './office/editor/EditorToolbar.js';
@@ -46,9 +53,19 @@ import { OfficeState } from './office/engine/officeState.js';
 import { isRotatable } from './office/layout/furnitureCatalog.js';
 import { EditTool } from './office/types.js';
 import {
+  deleteCompany,
+  fetchCompanies,
   fetchCompanyProjects,
+  fetchCompanyStats,
+  fetchIssueById,
+  fetchIssueDescendants,
+  fetchParticipantIssues,
   getActiveCompanyId,
+  resetPaperclipApiState,
   subscribeActivity,
+  uuidForNumericAgentId,
+  type PaperclipCompany,
+  type PaperclipCompanyStats,
   type PaperclipIssue,
   type PaperclipProject,
 } from './paperclipApi.js';
@@ -74,12 +91,69 @@ function getOfficeState(): OfficeState {
   return officeStateRef.current;
 }
 
+// localStorage key for the last-chosen company id. Survives reloads
+// so the user returns to the same workspace they left.
+const LS_ACTIVE_COMPANY_ID = 'goboost.activeCompanyId';
+
+function readStoredCompanyId(): string | null {
+  try {
+    return localStorage.getItem(LS_ACTIVE_COMPANY_ID);
+  } catch {
+    return null;
+  }
+}
+
 function App() {
   // ── Projects / bookmarks state ────────────────────────────────────────────
   // `paperclipReady` flips true once the WS handshake completes — only then
   // is `getActiveCompanyId()` populated, so project loading waits on it.
   const [paperclipReady, setPaperclipReady] = useState(false);
   const [projects, setProjects] = useState<PaperclipProject[]>([]);
+
+  // ── Workspace (company) state — Session 8 ─────────────────────────────────
+  // `activeCompanyId` is the SOURCE OF TRUTH for which company we're
+  // bound to. Changing it triggers the bootstrap effect to tear down
+  // the current API connection and re-bootstrap with the new id.
+  const [activeCompanyId, setActiveCompanyId] = useState<string | null>(
+    () => readStoredCompanyId(),
+  );
+  const [companies, setCompanies] = useState<PaperclipCompany[]>([]);
+  const [companyStats, setCompanyStats] = useState<
+    Record<string, PaperclipCompanyStats>
+  >({});
+  const [connectionState, setConnectionState] = useState<string>('connecting');
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardFirstRun, setWizardFirstRun] = useState(false);
+  // Which company's settings are currently open. Null = closed. Stored
+  // separately from `activeCompanyId` because per-row ⚙ in the switcher
+  // can open settings for ANY company, not just the active one.
+  const [companySettingsCompanyId, setCompanySettingsCompanyId] = useState<
+    string | null
+  >(null);
+
+  // Refresh companies list after any change (create / archive / settings
+  // edit). Called from the wizard's onLaunch + the settings modal's
+  // onChanged / onArchived / onDeleted.
+  const reloadCompanies = useCallback(async () => {
+    const [list, stats] = await Promise.all([
+      fetchCompanies(),
+      fetchCompanyStats(),
+    ]);
+    setCompanies(list);
+    setCompanyStats(stats);
+  }, []);
+
+  const switchToCompany = useCallback((companyId: string) => {
+    // Persist + change active id. The bootstrap effect re-runs (its
+    // cleanup tears down state, then it boots fresh with this id as
+    // `preferredCompanyId`).
+    try {
+      localStorage.setItem(LS_ACTIVE_COMPANY_ID, companyId);
+    } catch {
+      // localStorage might fail in private mode — non-fatal.
+    }
+    setActiveCompanyId(companyId);
+  }, []);
   // The per-company bookmark arrangement (order / pins / issue-pins / active).
   // Loaded from localStorage once the company id is known.
   const [arrangement, setArrangement] = useState<BookmarkArrangement | null>(
@@ -103,6 +177,9 @@ function App() {
     let handle: import('./paperclipApi.js').PaperclipApiHandle | null = null;
     let stopSpeechBridge: (() => void) | null = null;
 
+    setPaperclipReady(false);
+    setConnectionState('connecting');
+
     void (async () => {
       const { dispatchMockMessages } = await import('./browserMock.js');
       if (stopped) return;
@@ -113,11 +190,31 @@ function App() {
         (import.meta.env.VITE_PAPERCLIP_API_URL as string | undefined) ?? undefined;
       handle = await startPaperclipApi({
         baseUrl,
+        // Pass the localStorage-derived preference so re-bootstraps
+        // after a workspace switch land on the new company instead of
+        // falling back to "first company in the list".
+        preferredCompanyId: activeCompanyId,
         onStatusChange: (status) => {
+          setConnectionState(status.state);
           // Once connected, the company id is populated — unblock the
-          // bookmarks/projects load.
+          // bookmarks/projects load + fetch the companies list for
+          // the WorkspaceSwitcher dropdown.
           if (status.state === 'connected') {
             setPaperclipReady(true);
+            // Sync local activeCompanyId with whatever startPaperclipApi
+            // actually picked (e.g. when the stored id was archived
+            // and it fell back to firstActive).
+            const picked = getActiveCompanyId();
+            if (picked && picked !== activeCompanyId) {
+              try {
+                localStorage.setItem(LS_ACTIVE_COMPANY_ID, picked);
+              } catch {
+                /* noop */
+              }
+              setActiveCompanyId(picked);
+            }
+            // Load the companies list for the switcher dropdown.
+            void reloadCompanies();
             // Boot the speech bridge once — it subscribes to global
             // heartbeat/activity streams and dispatches text bubbles
             // onto the office canvas. Idempotent guard: only start the
@@ -126,22 +223,11 @@ function App() {
               stopSpeechBridge = startAgentSpeechBridge(getOfficeState);
             }
           }
-          // Reflect connection status into the bootstrap banner so the operator
-          // can see at a glance whether Paperclip is connected. Banner element
-          // is defined in index.html (#gb-bootstrap-banner .gb-left).
-          const el = document.querySelector('#gb-bootstrap-banner .gb-left');
-          if (!el) return;
-          const dot =
-            status.state === 'connected'
-              ? '🟢'
-              : status.state === 'connecting'
-                ? '🟡'
-                : status.state === 'disconnected'
-                  ? '🔴'
-                  : status.state === 'no-paperclip'
-                    ? '⚫'
-                    : '⚪';
-          el.textContent = `${dot} ${status.message}`;
+          if (status.state === 'no-company') {
+            // No companies on the Paperclip server → first-run wizard.
+            setWizardFirstRun(true);
+            setWizardOpen(true);
+          }
         },
       });
       // If cleanup ran while we were awaiting startPaperclipApi, stop the
@@ -156,8 +242,19 @@ function App() {
         stopSpeechBridge();
         stopSpeechBridge = null;
       }
+      // Workspace tear-down: wipe module-level caches so the next
+      // bootstrap (after a company switch) starts with a clean slate.
+      // Also clear the visible office characters so we don't show
+      // ghosts from the previous workspace during the transition.
+      resetPaperclipApiState();
+      try {
+        getOfficeState().clearAgents();
+      } catch {
+        /* office may not be initialized yet */
+      }
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCompanyId]);
 
   // ── Bookmarks: load projects + arrangement once Paperclip is connected ────
   // A first-time user (no stored arrangement) gets every project seeded
@@ -174,7 +271,10 @@ function App() {
       if (stored) {
         setArrangement(stored);
       } else {
-        const seeded = seedArrangement(list);
+        // First time in this company → dashboard view, no pins yet.
+        // ROOT issues created from this moment forward will auto-pin
+        // into the matching scope as `issue.created` events arrive.
+        const seeded = seedArrangement();
         setArrangement(seeded);
         saveArrangement(companyId, seeded);
       }
@@ -201,103 +301,143 @@ function App() {
     };
   }, [paperclipReady]);
 
-  // A safe fallback arrangement for the window before the real one loads.
-  const effectiveArrangement: BookmarkArrangement = arrangement ?? {
-    order: [GENERAL_BOOKMARK_ID],
-    issuePins: [],
-    activeId: GENERAL_BOOKMARK_ID,
-  };
+  // Auto-pin ROOT issues (parentId === null) into their matching
+  // scope on `issue.created`. Forward-only — Session 9.2 spec
+  // explicitly opts out of backfilling historical ROOTs. If the
+  // operator previously removed an auto-pin for this issue, the
+  // suppression list (`removedAutoPins`) keeps it off the bar.
+  //
+  // Activity details don't carry `parentId`/`projectId`, so we fetch
+  // the issue record once before deciding. The functional setState
+  // guards against the load-vs-event race: if arrangement isn't
+  // loaded yet, we skip rather than seed a fresh one and clobber
+  // the upcoming load.
+  useEffect(() => {
+    if (!paperclipReady) return;
+    const unsubscribe = subscribeActivity((payload) => {
+      if (String(payload.entityType ?? '') !== 'issue') return;
+      if (String(payload.action ?? '') !== 'issue.created') return;
+      const issueId = String(payload.entityId ?? '');
+      if (!issueId) return;
+      void fetchIssueById(issueId).then((issue) => {
+        if (!issue || issue.parentId != null) return;
+        setArrangement((cur) => {
+          if (!cur) return cur;
+          const next = autoPinRootIssue(cur, {
+            id: issue.id,
+            title: issue.title,
+            identifier: issue.identifier,
+            projectId: issue.projectId,
+          });
+          if (next === cur) return cur;
+          const companyId = getActiveCompanyId();
+          if (companyId) saveArrangement(companyId, next);
+          return next;
+        });
+      });
+    });
+    return unsubscribe;
+  }, [paperclipReady]);
 
-  const bookmarks = useMemo(
-    () => reconcileBookmarks(effectiveArrangement, projects),
-    [effectiveArrangement, projects],
-  );
-  const addableProjects = useMemo(
-    () => availableProjects(effectiveArrangement, projects),
-    [effectiveArrangement, projects],
-  );
-  const activeBookmarkId = effectiveArrangement.activeId;
-  const activeScope = useMemo(
-    () => activeScopeOf(effectiveArrangement, bookmarks),
-    [effectiveArrangement, bookmarks],
-  );
+  // A safe fallback arrangement for the window before the real one
+  // loads — dashboard mode, no scopes populated yet.
+  const effectiveArrangement: BookmarkArrangement = arrangement ?? seedArrangement();
 
-  // All arrangement mutators use the functional setState form so they
-  // never capture a stale closure, and persist on every change.
-  const onSelectBookmark = useCallback(
-    (id: string) => {
+  // Pin tabs visible to the right of the selector — ALWAYS just the
+  // active scope's pins. Swaps automatically when the operator
+  // changes the selector.
+  const pinnedBookmarks = useMemo(
+    () => activeScopeBookmarks(effectiveArrangement),
+    [effectiveArrangement],
+  );
+  const activePinId = useMemo(() => {
+    const here = getScopeArrangement(
+      effectiveArrangement,
+      effectiveArrangement.activeScope,
+    );
+    return here.activePinId;
+  }, [effectiveArrangement]);
+
+  // What the chat panel reads — either the active pin's issue scope
+  // or the active project scope itself. CRITICAL: we key the memo on
+  // PRIMITIVE fields, not on `effectiveArrangement` as a whole.
+  //
+  // Why this matters: WhatsAppPanel's forest-load effect depends on
+  // `activeScope` identity. If we re-create the activeScope object on
+  // every arrangement update (e.g. when auto-pin fires or any pin is
+  // added in any scope), the child effect re-fires, the agent forest
+  // gets refetched, the active issue gets reset to default, the chat
+  // composer's draft is lost, and inflight messages appear to "vanish".
+  // Memoizing on (kind, projectId, activePinId) keeps the reference
+  // stable as long as the chat-relevant scope hasn't actually changed.
+  const _scopeKind = effectiveArrangement.activeScope.kind;
+  const _scopeProjectId =
+    effectiveArrangement.activeScope.kind === 'project'
+      ? effectiveArrangement.activeScope.projectId
+      : null;
+  const activeScope = useMemo(() => {
+    return activeChatScope(effectiveArrangement);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [_scopeKind, _scopeProjectId, activePinId]);
+
+  // ── Arrangement mutators ─────────────────────────────────────────
+  // All use the functional setState form so they never capture a
+  // stale closure, and persist on every change. The bookmarks module
+  // exports pure helpers — App just wires them to React state.
+
+  const persist = useCallback(
+    (updater: (cur: BookmarkArrangement) => BookmarkArrangement) => {
       setArrangement((cur) => {
-        const base = cur ?? effectiveArrangement;
-        const next = { ...base, activeId: id };
+        const base = cur ?? seedArrangement();
+        const next = updater(base);
         const companyId = getActiveCompanyId();
         if (companyId) saveArrangement(companyId, next);
         return next;
       });
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
-  const onReorderBookmarks = useCallback((orderedIds: string[]) => {
-    setArrangement((cur) => {
-      if (!cur) return cur;
-      const next = { ...cur, order: orderedIds };
-      const companyId = getActiveCompanyId();
-      if (companyId) saveArrangement(companyId, next);
-      return next;
-    });
-  }, []);
-  const onRemoveBookmark = useCallback((id: string) => {
-    setArrangement((cur) => {
-      if (!cur) return cur;
-      const next: BookmarkArrangement = {
-        order: cur.order.filter((o) => o !== id),
-        issuePins: cur.issuePins.filter(
-          (p) => issueBookmarkId(p.issueId) !== id,
-        ),
-        activeId:
-          cur.activeId === id ? GENERAL_BOOKMARK_ID : cur.activeId,
-      };
-      const companyId = getActiveCompanyId();
-      if (companyId) saveArrangement(companyId, next);
-      return next;
-    });
-  }, []);
-  // Add an existing project's tab to the bar (and select it).
-  const onAddProject = useCallback((projectId: string) => {
-    setArrangement((cur) => {
-      if (!cur) return cur;
-      const id = projectBookmarkId(projectId);
-      if (cur.order.includes(id)) {
-        return { ...cur, activeId: id };
-      }
-      const next = { ...cur, order: [...cur.order, id], activeId: id };
-      const companyId = getActiveCompanyId();
-      if (companyId) saveArrangement(companyId, next);
-      return next;
-    });
-  }, []);
 
-  // Pin the chat's active issue as a new issue-scope bookmark.
-  const pinIssueAsBookmark = useCallback((issue: PaperclipIssue) => {
-    setArrangement((cur) => {
-      if (!cur) return cur;
-      const id = issueBookmarkId(issue.id);
-      let next: BookmarkArrangement;
-      if (cur.issuePins.some((p) => p.issueId === issue.id)) {
-        next = { ...cur, activeId: id };
-      } else {
-        const label = `${issue.identifier ?? '—'} · ${issue.title}`;
-        next = {
-          order: [...cur.order, id],
-          issuePins: [...cur.issuePins, { issueId: issue.id, label }],
-          activeId: id,
-        };
-      }
-      const companyId = getActiveCompanyId();
-      if (companyId) saveArrangement(companyId, next);
-      return next;
-    });
-  }, []);
+  const onSelectScope = useCallback(
+    (scope: ProjectScope) => {
+      persist((cur) => setActiveScope(cur, scope));
+    },
+    [persist],
+  );
+  const onSelectPin = useCallback(
+    (issueId: string | null) => {
+      persist((cur) => setActivePin(cur, cur.activeScope, issueId));
+    },
+    [persist],
+  );
+  const onReorderPins = useCallback(
+    (orderedIssueIds: string[]) => {
+      persist((cur) => reorderPins(cur, cur.activeScope, orderedIssueIds));
+    },
+    [persist],
+  );
+  const onRemovePin = useCallback(
+    (issueId: string) => {
+      persist((cur) => unpinIssue(cur, cur.activeScope, issueId));
+    },
+    [persist],
+  );
+
+  // Manual pin from the chat panel (📌). Goes into the CURRENT scope,
+  // not the issue's project scope — operator is explicitly bookmarking
+  // it for their current context.
+  const pinIssueAsBookmark = useCallback(
+    (issue: PaperclipIssue) => {
+      const label = `${issue.identifier ?? '—'} · ${issue.title}`;
+      persist((cur) =>
+        pinIssueInArrangement(cur, cur.activeScope, {
+          issueId: issue.id,
+          label,
+        }),
+      );
+    },
+    [persist],
+  );
 
   // ── Project create / edit modals ──────────────────────────────────────────
   // `editingProjectId` non-null → edit modal open; `creatingProject` →
@@ -306,8 +446,6 @@ function App() {
   const [editingProjectId, setEditingProjectId] = useState<string | null>(
     null,
   );
-  // The "+" add-project modal (list of addable projects + create-new).
-  const [addMenuOpen, setAddMenuOpen] = useState(false);
   // Goals modal — independent of bookmarks; opened by the 🎯 button.
   const [goalsOpen, setGoalsOpen] = useState(false);
   // Org-chart modal — opened by the 🏢 button.
@@ -331,15 +469,19 @@ function App() {
     description?: string;
     contextHint?: string;
   } | null>(null);
-  // Refetch projects + (for create) drop the new tab into the bar.
+  // Refetch projects + (when a project is created) select it on the
+  // project selector so the operator lands inside the new project's
+  // empty pin space immediately.
   const onProjectsChanged = useCallback(
     (focusProjectId?: string) => {
       void fetchCompanyProjects().then((list) => {
         setProjects(list);
-        if (focusProjectId) onAddProject(focusProjectId);
+        if (focusProjectId) {
+          onSelectScope({ kind: 'project', projectId: focusProjectId });
+        }
       });
     },
-    [onAddProject],
+    [onSelectScope],
   );
 
   const editor = useEditorActions(getOfficeState, editorState);
@@ -370,6 +512,121 @@ function App() {
     setHooksEnabled,
     hooksInfoShown,
   } = useExtensionMessages(getOfficeState, editor.setLastSavedLayout, isEditDirty);
+
+  // ── Session 9.3 — scope-driven agent visibility ─────────────────
+  //
+  // When the active scope changes (or when a relevant issue activity
+  // fires), recompute which agents are "involved" in the scope and
+  // push the visibility decision into OfficeState. The engine's tick
+  // lerps each character's `displayAlpha` toward `targetAlpha` over
+  // ~500ms — see `ALPHA_LERP_PER_SECOND` in characters.ts.
+  //
+  // Involvement per scope:
+  //   • dashboard → everyone (short-circuit, no network call)
+  //   • general   → agents whose participant-issues include any
+  //                 with `projectId == null`
+  //   • project   → agents whose participant-issues include any in
+  //                 that project
+  //   • issue     → agents whose assignee/creator id appears on the
+  //                 pinned issue OR its descendants (v1 — comment-
+  //                 author participation in this scope is deferred;
+  //                 the participant filter already covers it for
+  //                 project/general)
+  //
+  // The currently-selected agent is ALWAYS visible regardless — the
+  // operator just clicked them, whisking them away would feel hostile.
+  //
+  // Activity invalidation: any `issue.*` event that could move an
+  // agent in or out of the scope (assignee changed, project moved,
+  // parent re-parented, created) triggers a debounced recompute.
+  // Comment/attachment/document noise is ignored — those don't shift
+  // assignee/creator/project membership.
+  useEffect(() => {
+    if (!paperclipReady) return;
+    let cancelled = false;
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+
+    const recompute = async () => {
+      const uuidPairs = agents
+        .map((id) => ({ id, uuid: uuidForNumericAgentId(id) }))
+        .filter((p): p is { id: number; uuid: string } => !!p.uuid);
+
+      if (activeScope.kind === 'dashboard') {
+        if (cancelled) return;
+        getOfficeState().clearAgentVisibility();
+        return;
+      }
+
+      let involved: Set<string>;
+      if (activeScope.kind === 'issue') {
+        const issueId = activeScope.issueId;
+        const [head, descendants] = await Promise.all([
+          fetchIssueById(issueId),
+          fetchIssueDescendants(issueId),
+        ]);
+        if (cancelled) return;
+        const all = [head, ...descendants].filter(
+          (i): i is PaperclipIssue => i != null,
+        );
+        involved = new Set<string>();
+        for (const i of all) {
+          if (i.assigneeAgentId) involved.add(i.assigneeAgentId);
+          if (i.createdByAgentId) involved.add(i.createdByAgentId);
+        }
+      } else {
+        // general / project — per-agent participant probe, in parallel.
+        const results = await Promise.all(
+          uuidPairs.map(async ({ uuid }) => {
+            const opts =
+              activeScope.kind === 'project'
+                ? { projectId: activeScope.projectId }
+                : undefined;
+            const issues = await fetchParticipantIssues(uuid, opts);
+            const filtered =
+              activeScope.kind === 'general'
+                ? issues.filter((i) => i.projectId == null)
+                : issues;
+            return { uuid, hit: filtered.length > 0 };
+          }),
+        );
+        if (cancelled) return;
+        involved = new Set(
+          results.filter((r) => r.hit).map((r) => r.uuid),
+        );
+      }
+
+      const visibleIds = new Set<number>();
+      for (const { id, uuid } of uuidPairs) {
+        if (involved.has(uuid)) visibleIds.add(id);
+      }
+      if (selectedAgent != null) visibleIds.add(selectedAgent);
+      getOfficeState().applyVisibilityFromSet(visibleIds);
+    };
+
+    // Light debounce on the initial run so a scope change + WS replay
+    // burst fold into one recompute.
+    debounce = setTimeout(() => void recompute(), 120);
+
+    const unsubscribe = subscribeActivity((payload) => {
+      const entityType = String(payload.entityType ?? '');
+      if (entityType !== 'issue') return;
+      const action = String(payload.action ?? '');
+      if (/comment|attachment|document/i.test(action)) return;
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(() => void recompute(), 250);
+    });
+
+    return () => {
+      cancelled = true;
+      if (debounce) clearTimeout(debounce);
+      unsubscribe();
+    };
+    // `agents` deliberately omitted: re-running on every agents-array
+    // identity change (which can happen on routine UI events) would
+    // produce a recompute storm. New agents enter at full alpha by
+    // default and the next scope change picks them up.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paperclipReady, activeScope, selectedAgent]);
 
   // Show migration notice once layout reset is detected
   const [migrationNoticeDismissed, setMigrationNoticeDismissed] = useState(false);
@@ -517,46 +774,48 @@ function App() {
         panRef={editor.panRef}
       />
 
-      {/* GoBoost project bookmarks — full-width scope strip below the
-          connection banner. Switching a tab re-filters every agent's
-          issue forest in the chat panel. */}
+      {/* GoBoost project bookmarks — Session 9.2 redesign. First slot
+          is a ProjectSelector chip; the strip to its left shows the
+          ACTIVE scope's pinned issues. Switching scopes swaps the pin
+          set; per-scope arrangement persists per company. */}
       <BookmarksBar
-        bookmarks={bookmarks}
-        activeId={activeBookmarkId}
+        activeScope={effectiveArrangement.activeScope}
+        projects={projects}
+        pinnedBookmarks={pinnedBookmarks}
+        activePinId={activePinId}
         height={BOOKMARKS_BAR_HEIGHT}
-        onSelect={onSelectBookmark}
-        onReorder={onReorderBookmarks}
-        onRemove={onRemoveBookmark}
+        onSelectScope={onSelectScope}
+        onSelectPin={onSelectPin}
+        onReorderPins={onReorderPins}
+        onRemovePin={onRemovePin}
         onEditProject={(projectId) => setEditingProjectId(projectId)}
-        onOpenAddMenu={() => setAddMenuOpen(true)}
+        onCreateProject={() => setCreatingProject(true)}
         onOpenGoals={() => setGoalsOpen(true)}
         onOpenOrgChart={() => setOrgChartOpen(true)}
       />
 
       {/* GoBoost WhatsApp Chat Panel — Iteration 2.B.1.
-          Fixed right-side overlay; binds to currently-selected agent. */}
+          Fixed right-side overlay; binds to currently-selected agent.
+
+          `key={activeCompanyId}` forces a full unmount/remount when the
+          workspace switches. The panel caches per-company state (agent
+          roster for the assignee picker, active issue, comments) that
+          MUST NOT survive across companies — leaking the previous org's
+          agents into the new org's picker was a real bug. The remount
+          keeps every effect's initial load clean against the new
+          company's data. */}
       <WhatsAppPanel
+        key={activeCompanyId ?? 'no-company'}
         selectedAgentId={selectedAgent}
         selectedAgentName={selectedAgentName}
         activeScope={activeScope}
         onPinIssue={pinIssueAsBookmark}
       />
 
-      {/* Project add / create / edit modals. */}
-      {addMenuOpen ? (
-        <ProjectAddModal
-          availableProjects={addableProjects}
-          onClose={() => setAddMenuOpen(false)}
-          onAddProject={(projectId) => {
-            setAddMenuOpen(false);
-            onAddProject(projectId);
-          }}
-          onCreateNew={() => {
-            setAddMenuOpen(false);
-            setCreatingProject(true);
-          }}
-        />
-      ) : null}
+      {/* Project create / edit modals. The legacy ProjectAddModal
+          ("+ add existing project to bar") was retired in 9.2 — every
+          project is now automatically available in the selector
+          dropdown; the add flow is just create-new. */}
       {creatingProject ? (
         <ProjectCreateModal
           onClose={() => setCreatingProject(false)}
@@ -571,9 +830,17 @@ function App() {
           projectId={editingProjectId}
           onClose={() => setEditingProjectId(null)}
           onChanged={() => onProjectsChanged()}
-          onArchived={(projectId) => {
+          onArchived={(archivedId) => {
             setEditingProjectId(null);
-            onRemoveBookmark(projectBookmarkId(projectId));
+            // If the archived project was the active scope, fall back
+            // to dashboard so the operator never lands on a phantom
+            // selector entry.
+            if (
+              effectiveArrangement.activeScope.kind === 'project' &&
+              effectiveArrangement.activeScope.projectId === archivedId
+            ) {
+              onSelectScope({ kind: 'dashboard' });
+            }
             onProjectsChanged();
           }}
         />
@@ -640,6 +907,131 @@ function App() {
         />
       ) : null}
 
+      {/* Workspace switcher — portal-mounted into #gb-bootstrap-banner.
+          Renders always (even when companies list is empty) so the
+          user can always pop the "+ workspace חדש" CTA from the dropdown. */}
+      <WorkspaceSwitcher
+        companies={companies}
+        activeCompanyId={activeCompanyId}
+        stats={companyStats}
+        connectionState={connectionState}
+        onSwitch={switchToCompany}
+        onCreateNew={() => {
+          setWizardFirstRun(false);
+          setWizardOpen(true);
+        }}
+        onOpenSettings={(companyId) =>
+          setCompanySettingsCompanyId(companyId)
+        }
+        onDeleteCompany={async (companyId) => {
+          const target = companies.find((c) => c.id === companyId);
+          const name = target?.name ?? 'החברה';
+          const confirmed = window.confirm(
+            `למחוק לצמיתות את "${name}"?\n\nפעולה זו לא ניתנת לביטול: כל הסוכנים, המשימות והנתונים של החברה יאבדו.`,
+          );
+          if (!confirmed) return;
+          const ok = await deleteCompany(companyId);
+          if (!ok) {
+            window.alert(
+              `מחיקת "${name}" נכשלה. ייתכן שאינך admin/board ב-Paperclip, או שהשרת לא זמין.`,
+            );
+            return;
+          }
+          await reloadCompanies();
+          // If the deleted company was the active one, switch to the
+          // next available active workspace; otherwise stay put.
+          if (companyId === activeCompanyId) {
+            const next = companies.find(
+              (c) => c.id !== companyId && c.status !== 'archived',
+            );
+            if (next) {
+              switchToCompany(next.id);
+            } else {
+              try {
+                localStorage.removeItem(LS_ACTIVE_COMPANY_ID);
+              } catch {
+                /* noop */
+              }
+              setActiveCompanyId(null);
+            }
+          }
+        }}
+      />
+
+      {wizardOpen ? (
+        <CompanyOnboardingWizard
+          isFirstRun={wizardFirstRun}
+          onClose={() => {
+            // First-run wizard is non-dismissible — guard regardless.
+            if (wizardFirstRun) return;
+            setWizardOpen(false);
+          }}
+          onLaunch={(company) => {
+            setWizardOpen(false);
+            setWizardFirstRun(false);
+            // Refresh the companies list, THEN switch — switch triggers
+            // tear-down + rebootstrap which then re-reloads companies
+            // anyway, but doing it eagerly here means the switcher has
+            // the new entry the moment the wizard closes.
+            void reloadCompanies();
+            switchToCompany(company.id);
+          }}
+        />
+      ) : null}
+
+      {companySettingsCompanyId ? (
+        <CompanySettingsModal
+          companyId={companySettingsCompanyId}
+          onClose={() => setCompanySettingsCompanyId(null)}
+          onChanged={async () => {
+            await reloadCompanies();
+          }}
+          onArchived={async () => {
+            const archivedId = companySettingsCompanyId;
+            await reloadCompanies();
+            setCompanySettingsCompanyId(null);
+            // If the archived company was the active one, switch to
+            // another active company (or null → triggers no-company
+            // flow which auto-opens the wizard).
+            if (archivedId === activeCompanyId) {
+              const next = companies.find(
+                (c) => c.id !== archivedId && c.status !== 'archived',
+              );
+              if (next) {
+                switchToCompany(next.id);
+              } else {
+                try {
+                  localStorage.removeItem(LS_ACTIVE_COMPANY_ID);
+                } catch {
+                  /* noop */
+                }
+                setActiveCompanyId(null);
+              }
+            }
+          }}
+          onDeleted={async () => {
+            const deletedId = companySettingsCompanyId;
+            await reloadCompanies();
+            setCompanySettingsCompanyId(null);
+            if (deletedId === activeCompanyId) {
+              const next = companies.find(
+                (c) => c.id !== deletedId && c.status !== 'archived',
+              );
+              if (next) {
+                switchToCompany(next.id);
+              } else {
+                try {
+                  localStorage.removeItem(LS_ACTIVE_COMPANY_ID);
+                } catch {
+                  /* noop */
+                }
+                setActiveCompanyId(null);
+              }
+            }
+          }}
+        />
+      ) : null}
+
       {!isDebugMode ? (
         <>
           <ZoomControls zoom={editor.zoom} onZoomChange={editor.handleZoomChange} />
@@ -701,6 +1093,17 @@ function App() {
             panRef={editor.panRef}
             onCloseAgent={handleCloseAgent}
             alwaysShowOverlay={alwaysShowOverlay}
+          />
+          {/* Always-visible per-agent status badges (Session 9.1):
+              💤 idle / ⚙️ working / ❗ waiting / 🚨 failed / ⏸ paused.
+              Sits above ToolOverlay/AgentActionToolbar in DOM order so
+              the badges stay readable when a hover overlay opens. */}
+          <AgentStatusBadges
+            officeState={officeState}
+            agents={agents}
+            containerRef={containerRef}
+            zoom={editor.zoom}
+            panRef={editor.panRef}
           />
           {/* Agent action toolbar — floats above the selected agent's
               ToolOverlay. Distinct layer so the metadata strip below

@@ -171,9 +171,33 @@ export type PaperclipStatusListener = (status: PaperclipStatusDetail) => void;
 
 // ── Types we read from Paperclip API responses ────────────────────────────
 
-interface PaperclipCompany {
+// Public — exported so the workspace switcher can list companies.
+// Bootstrap originally typed this as a 2-field interface; expanded in
+// Session 8 to mirror the full schema.
+export interface PaperclipCompany {
   id: string;
   name: string;
+  description?: string | null;
+  status?: 'active' | 'paused' | 'archived' | string;
+  pauseReason?: string | null;
+  pausedAt?: string | null;
+  issuePrefix?: string;
+  budgetMonthlyCents?: number;
+  spentMonthlyCents?: number;
+  attachmentMaxBytes?: number;
+  requireBoardApprovalForNewAgents?: boolean;
+  brandColor?: string | null;
+  logoAssetId?: string | null;
+  feedbackDataSharingEnabled?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface PaperclipCompanyStats {
+  /** Number of agents in the company. */
+  agentCount?: number;
+  /** Number of issues in the company. */
+  issueCount?: number;
 }
 
 interface PaperclipAgent {
@@ -926,6 +950,310 @@ export function getActiveCompanyId(): string | null {
 /** Returns the active company name, or null. Useful for headers. */
 export function getActiveCompanyName(): string | null {
   return moduleCompanyName;
+}
+
+/**
+ * Wipe all module-level caches so the next `startPaperclipApi`
+ * boot starts clean. Used by the workspace switcher when the user
+ * changes company — without this the agent UUID↔numericId map and
+ * the name cache would carry stale entries from the previous
+ * company, producing collisions and stale labels.
+ *
+ * NOT called automatically — the caller is responsible for stopping
+ * the existing API handle first (so the WS doesn't fight us on the
+ * way out).
+ */
+export function resetPaperclipApiState(): void {
+  moduleIdMapper = null;
+  agentNameByUuid.clear();
+  moduleCompanyId = null;
+  moduleCompanyName = null;
+  // Status listeners stay registered — they belong to React effects
+  // and will receive the next bootstrap's events normally.
+}
+
+// ── Companies CRUD (Session 8 — workspace management) ───────────
+//
+// List + create + update + archive + delete. Different actor roles
+// have different write permissions on Paperclip's side:
+//   • Board users      → can PATCH the full updateCompanySchema
+//   • CEO agents       → can only PATCH /branding (subset)
+//   • Instance admins  → can POST /companies + DELETE
+// Errors from these endpoints surface as HTTP 403 — callers should
+// handle 403 by falling back to a "open in Paperclip dashboard"
+// hint rather than failing silently.
+
+export async function fetchCompanies(): Promise<PaperclipCompany[]> {
+  const url = `${moduleBaseUrl}/api/companies`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    return (await r.json()) as PaperclipCompany[];
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanies failed:', err);
+    return [];
+  }
+}
+
+export async function fetchCompanyStats(): Promise<
+  Record<string, PaperclipCompanyStats>
+> {
+  const url = `${moduleBaseUrl}/api/companies/stats`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return {};
+    return (await r.json()) as Record<string, PaperclipCompanyStats>;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompanyStats failed:', err);
+    return {};
+  }
+}
+
+export async function fetchCompany(
+  companyId: string,
+): Promise<PaperclipCompany | null> {
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipCompany;
+  } catch (err) {
+    console.warn('[PaperclipApi] fetchCompany failed:', err);
+    return null;
+  }
+}
+
+export interface CreateCompanyInput {
+  name: string;
+  description?: string | null;
+  budgetMonthlyCents?: number;
+  attachmentMaxBytes?: number;
+}
+
+export async function createCompany(
+  input: CreateCompanyInput,
+): Promise<PaperclipCompany | null> {
+  const url = `${moduleBaseUrl}/api/companies`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipCompany;
+  } catch (err) {
+    console.warn('[PaperclipApi] createCompany failed:', err);
+    return null;
+  }
+}
+
+export interface UpdateCompanyInput {
+  name?: string;
+  description?: string | null;
+  status?: 'active' | 'paused' | 'archived';
+  brandColor?: string | null;
+  logoAssetId?: string | null;
+  budgetMonthlyCents?: number;
+  attachmentMaxBytes?: number;
+  requireBoardApprovalForNewAgents?: boolean;
+  feedbackDataSharingEnabled?: boolean;
+}
+
+export async function updateCompany(
+  companyId: string,
+  patch: UpdateCompanyInput,
+): Promise<PaperclipCompany | null> {
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status} — ${txt.slice(0, 200)}`);
+    }
+    return (await r.json()) as PaperclipCompany;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateCompany failed:', err);
+    return null;
+  }
+}
+
+/** Branding-only update — works for CEO agents (subset of fields). */
+export async function updateCompanyBranding(
+  companyId: string,
+  patch: {
+    name?: string;
+    description?: string | null;
+    brandColor?: string | null;
+    logoAssetId?: string | null;
+  },
+): Promise<PaperclipCompany | null> {
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}/branding`;
+  try {
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipCompany;
+  } catch (err) {
+    console.warn('[PaperclipApi] updateCompanyBranding failed:', err);
+    return null;
+  }
+}
+
+export async function archiveCompany(
+  companyId: string,
+): Promise<PaperclipCompany | null> {
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}/archive`;
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    if (!r.ok) return null;
+    return (await r.json()) as PaperclipCompany;
+  } catch (err) {
+    console.warn('[PaperclipApi] archiveCompany failed:', err);
+    return null;
+  }
+}
+
+export async function deleteCompany(companyId: string): Promise<boolean> {
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] deleteCompany failed:', err);
+    return false;
+  }
+}
+
+/**
+ * Upload a logo image to Paperclip's assets store. Returns the new
+ * assetId — caller wires it to the company via updateCompanyBranding.
+ *
+ * `companyIdOverride` lets callers (CompanySettingsModal) target a
+ * specific company instead of relying on the module-level binding,
+ * which can lag the modal when settings are opened for a non-active
+ * company or right after a workspace switch.
+ */
+export async function uploadCompanyLogo(
+  file: File,
+  companyIdOverride?: string,
+): Promise<string | null> {
+  const companyId = companyIdOverride ?? moduleCompanyId;
+  if (!companyId) return null;
+  const fd = new FormData();
+  fd.append('file', file);
+  // Paperclip's dedicated logo endpoint — sanitizes SVGs, enforces
+  // image-mimetype allowlist, returns `{ assetId, ... }`. The earlier
+  // path `/assets` (without `/logo`) doesn't exist and returns 404.
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}/logo`;
+  try {
+    const r = await fetch(url, { method: 'POST', body: fd });
+    if (!r.ok) return null;
+    const raw = (await r.json()) as { id?: string; assetId?: string };
+    return raw.id ?? raw.assetId ?? null;
+  } catch (err) {
+    console.warn('[PaperclipApi] uploadCompanyLogo failed:', err);
+    return null;
+  }
+}
+
+// Generate a single-use OpenClaw invite (Settings → Invites flow).
+export interface OpenClawInvite {
+  token: string;
+  prompt: string;
+  expiresAt?: string;
+}
+
+export async function generateOpenClawInvite(): Promise<OpenClawInvite | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/access/open-claw-invite-prompt`;
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ companyId: moduleCompanyId }),
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as OpenClawInvite;
+  } catch (err) {
+    console.warn('[PaperclipApi] generateOpenClawInvite failed:', err);
+    return null;
+  }
+}
+
+// Export / Import package endpoints (Settings → Packages flow).
+export async function previewCompanyExport(): Promise<unknown> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/exports/preview`;
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (err) {
+    console.warn('[PaperclipApi] previewCompanyExport failed:', err);
+    return null;
+  }
+}
+
+export async function createCompanyExport(): Promise<{
+  downloadUrl?: string;
+  id?: string;
+} | null> {
+  if (!moduleCompanyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/exports`;
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    if (!r.ok) return null;
+    return (await r.json()) as { downloadUrl?: string; id?: string };
+  } catch (err) {
+    console.warn('[PaperclipApi] createCompanyExport failed:', err);
+    return null;
+  }
+}
+
+export async function previewCompanyImport(file: File): Promise<unknown> {
+  if (!moduleCompanyId) return null;
+  const fd = new FormData();
+  fd.append('file', file);
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/imports/preview`;
+  try {
+    const r = await fetch(url, { method: 'POST', body: fd });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (err) {
+    console.warn('[PaperclipApi] previewCompanyImport failed:', err);
+    return null;
+  }
+}
+
+export async function applyCompanyImport(file: File): Promise<boolean> {
+  if (!moduleCompanyId) return false;
+  const fd = new FormData();
+  fd.append('file', file);
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/imports/apply`;
+  try {
+    const r = await fetch(url, { method: 'POST', body: fd });
+    return r.ok;
+  } catch (err) {
+    console.warn('[PaperclipApi] applyCompanyImport failed:', err);
+    return false;
+  }
+}
+
+/** Build a URL for a company asset (used to display the logo). */
+export function companyAssetUrl(assetId: string | null | undefined): string | null {
+  if (!assetId) return null;
+  return `${moduleBaseUrl}/api/assets/${encodeURIComponent(assetId)}/content`;
 }
 
 /** Translate numeric pixel-agents id → Paperclip UUID. */
@@ -2533,9 +2861,18 @@ export interface CreateAgentResult {
 /** Create a new agent. Endpoint: `POST /companies/:id/agent-hires`. */
 export async function createAgentHire(
   input: CreateAgentInput,
+  /**
+   * Optional company-id override. Used by the onboarding wizard, which
+   * needs to create the first agent under a company that was just
+   * created in the same launch sequence — before `startPaperclipApi`
+   * has had a chance to re-bootstrap and bind the module to it.
+   * Falls back to the module-level active company when omitted.
+   */
+  companyIdOverride?: string,
 ): Promise<CreateAgentResult | null> {
-  if (!moduleCompanyId) return null;
-  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/agent-hires`;
+  const companyId = companyIdOverride ?? moduleCompanyId;
+  if (!companyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}/agent-hires`;
   try {
     const r = await fetch(url, {
       method: 'POST',
@@ -2625,10 +2962,18 @@ export async function fetchGoalById(goalId: string): Promise<PaperclipGoal | nul
   }
 }
 
-/** Create a goal. `title` and `level` are required by the backend. */
-export async function createGoal(input: GoalInput): Promise<PaperclipGoal | null> {
-  if (!moduleCompanyId) return null;
-  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/goals`;
+/**
+ * Create a goal. `title` and `level` are required by the backend.
+ * `companyIdOverride` lets the onboarding wizard create the first goal
+ * under a just-created company before re-bootstrap binds the module to it.
+ */
+export async function createGoal(
+  input: GoalInput,
+  companyIdOverride?: string,
+): Promise<PaperclipGoal | null> {
+  const companyId = companyIdOverride ?? moduleCompanyId;
+  if (!companyId) return null;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}/goals`;
   try {
     const r = await fetch(url, {
       method: 'POST',
@@ -2945,7 +3290,13 @@ export async function updateIssueAssignee(
     const r = await fetch(url, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ assigneeAgentId }),
+      // Paperclip's data model is single-assignee (agent XOR user). If
+      // the issue currently has `assigneeUserId` set (e.g. the board
+      // user picked it up at some point), PATCHing only `assigneeAgentId`
+      // would leave both fields populated and the server rejects with
+      // 422 "Issue can only have one assignee". Clearing the user
+      // assignee in the same request is the documented escape hatch.
+      body: JSON.stringify({ assigneeAgentId, assigneeUserId: null }),
     });
     if (!r.ok) {
       const txt = await r.text().catch(() => '');
@@ -2976,26 +3327,34 @@ export async function updateIssueAssignee(
  */
 export type PaperclipIssueWorkMode = 'standard' | 'planning';
 
-export async function createIssue(args: {
-  title: string;
-  description?: string;
-  assigneeAgentId: string;
-  /** Status to start in. Defaults to 'todo' so heartbeats may pick it up. */
-  status?: string;
-  /** Optional priority — Paperclip's vocab: low / medium / high / urgent. */
-  priority?: string;
-  /** Optional parent issue — used for sub-tasks under a plan. */
-  parentId?: string | null;
-  /** Optional work mode. Server default is 'standard' when omitted. */
-  workMode?: PaperclipIssueWorkMode;
-  /** Optional goal this issue contributes to (single, nullable). */
-  goalId?: string | null;
-}): Promise<PaperclipIssue | null> {
-  if (!moduleCompanyId) {
+export async function createIssue(
+  args: {
+    title: string;
+    description?: string;
+    assigneeAgentId: string;
+    /** Status to start in. Defaults to 'todo' so heartbeats may pick it up. */
+    status?: string;
+    /** Optional priority — Paperclip's vocab: low / medium / high / urgent. */
+    priority?: string;
+    /** Optional parent issue — used for sub-tasks under a plan. */
+    parentId?: string | null;
+    /** Optional work mode. Server default is 'standard' when omitted. */
+    workMode?: PaperclipIssueWorkMode;
+    /** Optional goal this issue contributes to (single, nullable). */
+    goalId?: string | null;
+  },
+  /**
+   * Optional company-id override. Lets the wizard create the first
+   * issue under a just-created company before the module re-bootstraps.
+   */
+  companyIdOverride?: string,
+): Promise<PaperclipIssue | null> {
+  const companyId = companyIdOverride ?? moduleCompanyId;
+  if (!companyId) {
     console.warn('[PaperclipApi] createIssue called before company is known');
     return null;
   }
-  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(moduleCompanyId)}/issues`;
+  const url = `${moduleBaseUrl}/api/companies/${encodeURIComponent(companyId)}/issues`;
   try {
     const r = await fetch(url, {
       method: 'POST',
@@ -3095,6 +3454,13 @@ function mapPaperclipStatus(paperclipStatus: string): string {
 export interface StartPaperclipApiOptions {
   baseUrl?: string;
   onStatusChange?: PaperclipStatusListener;
+  /**
+   * Preferred company id to bind on bootstrap. When the caller knows
+   * which company to use (e.g. from localStorage after a workspace
+   * switch), it passes it here. Falls back to the first company in
+   * the list when omitted or unknown.
+   */
+  preferredCompanyId?: string | null;
 }
 
 export interface PaperclipApiHandle {
@@ -3136,15 +3502,25 @@ export async function startPaperclipApi(
     return null;
   }
 
-  // ── Step 2: pick a company (first one for MVP) ──
+  // ── Step 2: pick a company ──
+  // Preference order:
+  //   1. caller-supplied `preferredCompanyId` (workspace switcher
+  //      writes the last-chosen company to localStorage and feeds it
+  //      back here on bootstrap)
+  //   2. first non-archived company
+  //   3. first company in the list (fall back if everything's archived)
   if (companies.length === 0) {
     setStatus({
       state: 'no-company',
-      message: 'אין companies. צור אחת ב-Paperclip ב-:3100 ורענן.',
+      message: 'אין companies. צור אחת מהממשק (+ workspace) או ב-Paperclip ב-:3100.',
     });
     return null;
   }
-  const company = companies[0]!;
+  const preferred = opts.preferredCompanyId
+    ? companies.find((c) => c.id === opts.preferredCompanyId)
+    : null;
+  const firstActive = companies.find((c) => c.status !== 'archived');
+  const company = preferred ?? firstActive ?? companies[0]!;
   moduleCompanyId = company.id;
   moduleCompanyName = company.name;
   console.log(`[PaperclipApi] Connected to company: ${company.name} (${company.id})`);

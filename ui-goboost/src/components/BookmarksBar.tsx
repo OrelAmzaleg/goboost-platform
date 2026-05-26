@@ -1,51 +1,71 @@
 import { useState } from 'react';
 
-import { GENERAL_BOOKMARK_ID, type Bookmark } from '../bookmarks.js';
+import { issueIdFromBookmarkId, type Bookmark, type ProjectScope } from '../bookmarks.js';
+import { ProjectSelector } from './ProjectSelector.js';
+import type { PaperclipProject } from '../paperclipApi.js';
 
 /**
- * BookmarksBar — full-width strip of project-scope tabs at the top of the
- * screen. Each tab is a bookmark (general / project / issue-pin); the
- * active tab decides which scope filters every agent's issue forest.
+ * BookmarksBar — the project-scope strip at the top of the screen.
  *
- * The bar is curated:
- *   • click a tab           → select that scope
- *   • drag a tab            → reorder
- *   • × on a project/issue  → remove from the bar (NOT delete the project)
- *   • ⚙ on a project        → open the project edit modal
- *   • + (end of the row)    → opens the add-project modal (App-level)
+ * Session 9.2 redesign: the bar is now structured as
  *
- * Controlled component — App.tsx owns the state and persists it.
+ *   [ ProjectSelector chip ] [ pin1 ] [ pin2 ] ... [ separator ] [🎯] [🏢]
+ *
+ * Where:
+ *   • The selector is always the rightmost element (RTL inline-start)
+ *     and never scrolls.
+ *   • The pin tabs are the *active scope's* pinned issues — switching
+ *     the selector swaps the visible set.
+ *   • The selector also subsumes the previous "+ project" action and
+ *     the "general" tab, so the bar no longer carries a "+" button.
+ *
+ * Controlled — App.tsx owns the arrangement state.
  */
 
 export interface BookmarksBarProps {
-  bookmarks: Bookmark[];
-  activeId: string;
+  /** Currently-selected project scope (from arrangement.activeScope). */
+  activeScope: ProjectScope;
+  /** All active projects in the company (for the selector dropdown). */
+  projects: PaperclipProject[];
+  /**
+   * Pinned issues belonging to the active scope, in display order.
+   * Empty when the scope has no pins.
+   */
+  pinnedBookmarks: Bookmark[];
+  /** Active pin within the scope (null = the scope-root view). */
+  activePinId: string | null;
   /** Height in px — App offsets content below by banner + this. */
   height: number;
-  onSelect: (id: string) => void;
-  /** Receives the full id list in its new order. */
-  onReorder: (orderedIds: string[]) => void;
-  /** Remove a bookmark from the bar (project tab or issue-pin). */
-  onRemove: (id: string) => void;
-  /** Open the edit modal for a project. */
+  // ── Callbacks ───────────────────────────────────────────────────
+  onSelectScope: (scope: ProjectScope) => void;
+  /** Select a pin within the active scope. Pass `null` to clear back to scope-root. */
+  onSelectPin: (issueId: string | null) => void;
+  /** Reorder pins within the active scope. */
+  onReorderPins: (orderedIssueIds: string[]) => void;
+  /** Remove a pin from the active scope (auto-pin will be suppressed for it). */
+  onRemovePin: (issueId: string) => void;
+  /** Open the edit modal for a project — fires from the selector dropdown. */
   onEditProject: (projectId: string) => void;
-  /** Open the add-project modal. */
-  onOpenAddMenu: () => void;
-  /** Open the company-goals modal (feature-level button, not a bookmark). */
+  /** Open the create-project modal — fires from the selector dropdown footer. */
+  onCreateProject: () => void;
+  /** Open the company-goals modal (left-cluster feature button). */
   onOpenGoals: () => void;
-  /** Open the organizational hierarchy modal. */
+  /** Open the organizational hierarchy modal (left-cluster feature button). */
   onOpenOrgChart: () => void;
 }
 
 export function BookmarksBar({
-  bookmarks,
-  activeId,
+  activeScope,
+  projects,
+  pinnedBookmarks,
+  activePinId,
   height,
-  onSelect,
-  onReorder,
-  onRemove,
+  onSelectScope,
+  onSelectPin,
+  onReorderPins,
+  onRemovePin,
   onEditProject,
-  onOpenAddMenu,
+  onCreateProject,
   onOpenGoals,
   onOpenOrgChart,
 }: BookmarksBarProps) {
@@ -55,17 +75,17 @@ export function BookmarksBar({
 
   const commitReorder = (fromId: string, toId: string) => {
     if (fromId === toId) return;
-    const without = bookmarks.map((b) => b.id).filter((x) => x !== fromId);
-    const insertAt = without.indexOf(toId);
+    const fromIssueId = issueIdFromBookmarkId(fromId);
+    const toIssueId = issueIdFromBookmarkId(toId);
+    if (!fromIssueId || !toIssueId) return;
+    const ids = pinnedBookmarks
+      .map((b) => issueIdFromBookmarkId(b.id))
+      .filter((x): x is string => !!x);
+    const without = ids.filter((id) => id !== fromIssueId);
+    const insertAt = without.indexOf(toIssueId);
     if (insertAt < 0) return;
-    without.splice(insertAt, 0, fromId);
-    // General always leads — never let a drop push anything before it.
-    const gi = without.indexOf(GENERAL_BOOKMARK_ID);
-    if (gi > 0) {
-      without.splice(gi, 1);
-      without.unshift(GENERAL_BOOKMARK_ID);
-    }
-    onReorder(without);
+    without.splice(insertAt, 0, fromIssueId);
+    onReorderPins(without);
   };
 
   return (
@@ -83,239 +103,203 @@ export function BookmarksBar({
           borderBlockEnd: '1px solid rgba(255,255,255,0.08)',
           display: 'flex',
           alignItems: 'stretch',
-          gap: 4,
+          gap: 0,
           padding: '0 8px',
-          overflowX: 'auto',
+          // Outer container does NOT scroll — only the pinned-bookmarks
+          // strip in the middle scrolls. Otherwise the selector and the
+          // left feature cluster would scroll off the screen.
+          overflowX: 'visible',
           overflowY: 'visible',
-          zIndex: 101, // above the chat panel (z=100)
+          zIndex: 101,
           ['--gb-chat-font' as string]:
             "'Heebo', system-ui, -apple-system, sans-serif",
         } as React.CSSProperties
       }
     >
-      {bookmarks.map((bm) => {
-        const active = bm.id === activeId;
-        const isGeneral = bm.id === GENERAL_BOOKMARK_ID;
-        const draggable = !isGeneral;
-        const isDragTarget = overId === bm.id && dragId !== bm.id;
-        return (
+      {/* Right-edge: project selector (fixed, never scrolls). */}
+      <div
+        style={{
+          flexShrink: 0,
+          display: 'flex',
+          alignItems: 'center',
+          paddingInlineEnd: 6,
+        }}
+      >
+        <ProjectSelector
+          activeScope={activeScope}
+          projects={projects}
+          onSelectScope={onSelectScope}
+          onEditProject={onEditProject}
+          onCreateProject={onCreateProject}
+          hostHeight={height}
+        />
+      </div>
+
+      {/* Middle: scrollable pin tabs (active scope only). */}
+      <div
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: 'flex',
+          alignItems: 'stretch',
+          gap: 4,
+          overflowX: 'auto',
+          overflowY: 'visible',
+          paddingInline: 4,
+        }}
+      >
+        {pinnedBookmarks.length === 0 ? (
           <div
-            key={bm.id}
-            draggable={draggable}
-            onDragStart={(e) => {
-              if (!draggable) {
-                e.preventDefault();
-                return;
-              }
-              setDragId(bm.id);
-              e.dataTransfer.effectAllowed = 'move';
-            }}
-            onDragOver={(e) => {
-              if (dragId && dragId !== bm.id && !isGeneral) {
-                e.preventDefault();
-                e.dataTransfer.dropEffect = 'move';
-                setOverId(bm.id);
-              }
-            }}
-            onDragLeave={() => {
-              setOverId((cur) => (cur === bm.id ? null : cur));
-            }}
-            onDrop={(e) => {
-              e.preventDefault();
-              if (dragId) commitReorder(dragId, bm.id);
-              setDragId(null);
-              setOverId(null);
-            }}
-            onDragEnd={() => {
-              setDragId(null);
-              setOverId(null);
-            }}
-            onMouseEnter={() => setHoverId(bm.id)}
-            onMouseLeave={() =>
-              setHoverId((cur) => (cur === bm.id ? null : cur))
-            }
-            onClick={() => onSelect(bm.id)}
-            title={bm.label}
             style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 6,
               alignSelf: 'center',
-              height: 30,
-              paddingInline: 10,
-              borderRadius: 8,
-              cursor: draggable ? 'grab' : 'pointer',
-              flexShrink: 0,
-              maxWidth: 220,
-              background: active
-                ? 'rgba(99,102,241,0.3)'
-                : 'rgba(255,255,255,0.05)',
-              border: active
-                ? '1px solid rgba(129,140,248,0.7)'
-                : isDragTarget
-                  ? '1px dashed rgba(129,140,248,0.8)'
-                  : '1px solid rgba(255,255,255,0.08)',
-              color: active ? '#e0e7ff' : '#cbd5e1',
-              opacity: dragId === bm.id ? 0.4 : 1,
-              transition: 'background 0.12s, opacity 0.12s',
+              fontSize: 11,
+              color: '#64748b',
+              paddingInline: 8,
+              fontStyle: 'italic',
             }}
           >
-            {/* Leading marker — folder for general, color dot for a
-                project, bookmark glyph for an issue-pin. */}
-            {isGeneral ? (
-              <span aria-hidden style={{ fontSize: 13 }}>📁</span>
-            ) : bm.scope.kind === 'project' ? (
-              <span
-                aria-hidden
-                style={{
-                  width: 9,
-                  height: 9,
-                  borderRadius: '50%',
-                  background: bm.color ?? '#94a3b8',
-                  flexShrink: 0,
+            אין משימות נעוצות ב-{labelForScope(activeScope, projects)} —
+            משימות אב חדשות יתויגו אוטומטית.
+          </div>
+        ) : (
+          pinnedBookmarks.map((bm) => {
+            const issueId = issueIdFromBookmarkId(bm.id);
+            if (!issueId) return null;
+            const active = issueId === activePinId;
+            const isDragTarget = overId === bm.id && dragId !== bm.id;
+            return (
+              <div
+                key={bm.id}
+                draggable
+                onDragStart={(e) => {
+                  setDragId(bm.id);
+                  e.dataTransfer.effectAllowed = 'move';
                 }}
-              />
-            ) : (
-              <span aria-hidden style={{ fontSize: 12 }}>🔖</span>
-            )}
-
-            <span
-              style={{
-                fontSize: 12,
-                fontWeight: active ? 700 : 600,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {bm.label}
-            </span>
-
-            {/* Edit (projects only) — pencil, on hover. */}
-            {bm.isProject &&
-            hoverId === bm.id &&
-            bm.scope.kind === 'project' ? (
-              <button
-                type="button"
-                title="ערוך פרויקט"
-                aria-label="ערוך פרויקט"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (bm.scope.kind === 'project') {
-                    onEditProject(bm.scope.projectId);
+                onDragOver={(e) => {
+                  if (dragId && dragId !== bm.id) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    setOverId(bm.id);
                   }
                 }}
-                style={iconBtnStyle('#cbd5e1')}
-              >
-                ⚙
-              </button>
-            ) : null}
-
-            {/* Remove from bar — projects + issue-pins, on hover. */}
-            {bm.removable && hoverId === bm.id ? (
-              <button
-                type="button"
-                title="הסר מהבאר"
-                aria-label="הסר מהבאר"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onRemove(bm.id);
+                onDragLeave={() => {
+                  setOverId((cur) => (cur === bm.id ? null : cur));
                 }}
-                style={iconBtnStyle('#fca5a5')}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragId) commitReorder(dragId, bm.id);
+                  setDragId(null);
+                  setOverId(null);
+                }}
+                onDragEnd={() => {
+                  setDragId(null);
+                  setOverId(null);
+                }}
+                onMouseEnter={() => setHoverId(bm.id)}
+                onMouseLeave={() =>
+                  setHoverId((cur) => (cur === bm.id ? null : cur))
+                }
+                onClick={() => onSelectPin(active ? null : issueId)}
+                title={bm.label}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  alignSelf: 'center',
+                  height: 30,
+                  paddingInline: 10,
+                  borderRadius: 8,
+                  cursor: 'grab',
+                  flexShrink: 0,
+                  maxWidth: 220,
+                  background: active
+                    ? 'rgba(99,102,241,0.3)'
+                    : 'rgba(255,255,255,0.05)',
+                  border: active
+                    ? '1px solid rgba(129,140,248,0.7)'
+                    : isDragTarget
+                      ? '1px dashed rgba(129,140,248,0.8)'
+                      : '1px solid rgba(255,255,255,0.08)',
+                  color: active ? '#e0e7ff' : '#cbd5e1',
+                  opacity: dragId === bm.id ? 0.4 : 1,
+                  transition: 'background 0.12s, opacity 0.12s',
+                }}
               >
-                ×
-              </button>
-            ) : null}
-          </div>
-        );
-      })}
+                <span aria-hidden style={{ fontSize: 12 }}>🔖</span>
+                <span
+                  style={{
+                    fontSize: 12,
+                    fontWeight: active ? 700 : 600,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {bm.label}
+                </span>
+                {hoverId === bm.id ? (
+                  <button
+                    type="button"
+                    title="הסר נעיצה"
+                    aria-label="הסר נעיצה"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRemovePin(issueId);
+                    }}
+                    style={iconBtnStyle('#fca5a5')}
+                  >
+                    ×
+                  </button>
+                ) : null}
+              </div>
+            );
+          })
+        )}
+      </div>
 
-      {/* + add — opens the add-project modal (App-level). */}
-      <button
-        type="button"
-        title="הוסף פרויקט לבּאר"
-        aria-label="הוסף פרויקט לבּאר"
-        onClick={onOpenAddMenu}
+      {/* Visual separator between the scrollable pin row (right) and
+          the left feature cluster. */}
+      <div
+        aria-hidden
         style={{
-          alignSelf: 'center',
           flexShrink: 0,
-          width: 30,
-          height: 30,
-          display: 'inline-flex',
+          alignSelf: 'center',
+          width: 1,
+          height: 22,
+          background: 'rgba(255,255,255,0.15)',
+          marginInline: 8,
+        }}
+      />
+
+      {/* Left cluster — feature actions, fixed at the physical-left
+          edge, stacking under the WorkspaceSwitcher dropdown above. */}
+      <div
+        style={{
+          flexShrink: 0,
+          display: 'flex',
           alignItems: 'center',
-          justifyContent: 'center',
-          background: 'rgba(255,255,255,0.05)',
-          border: '1px solid rgba(255,255,255,0.12)',
-          borderRadius: 8,
-          color: '#cbd5e1',
-          cursor: 'pointer',
-          fontFamily: 'inherit',
-          fontSize: 18,
-          fontWeight: 700,
-          lineHeight: 1,
+          gap: 4,
         }}
       >
-        +
-      </button>
-
-      {/* 🎯 Goals — feature-level button (not a bookmark tab).
-          Set apart from the "+" button with a margin so it reads as
-          a separate action, not "another bookmark to add". */}
-      <button
-        type="button"
-        title="מטרות החברה"
-        aria-label="מטרות החברה"
-        onClick={onOpenGoals}
-        style={{
-          alignSelf: 'center',
-          flexShrink: 0,
-          width: 30,
-          height: 30,
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          background: 'rgba(255,255,255,0.05)',
-          border: '1px solid rgba(255,255,255,0.12)',
-          borderRadius: 8,
-          color: '#cbd5e1',
-          cursor: 'pointer',
-          fontFamily: 'inherit',
-          fontSize: 14,
-          lineHeight: 1,
-          marginInlineStart: 8,
-        }}
-      >
-        🎯
-      </button>
-
-      {/* 🏢 Org chart — same visual family as Goals; another feature-level
-          button. Both live to the left of the "+" in RTL terms. */}
-      <button
-        type="button"
-        title="מבנה ארגוני"
-        aria-label="מבנה ארגוני"
-        onClick={onOpenOrgChart}
-        style={{
-          alignSelf: 'center',
-          flexShrink: 0,
-          width: 30,
-          height: 30,
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          background: 'rgba(255,255,255,0.05)',
-          border: '1px solid rgba(255,255,255,0.12)',
-          borderRadius: 8,
-          color: '#cbd5e1',
-          cursor: 'pointer',
-          fontFamily: 'inherit',
-          fontSize: 14,
-          lineHeight: 1,
-          marginInlineStart: 4,
-        }}
-      >
-        🏢
-      </button>
+        <button
+          type="button"
+          title="מטרות החברה"
+          aria-label="מטרות החברה"
+          onClick={onOpenGoals}
+          style={featureBtnStyle}
+        >
+          🎯
+        </button>
+        <button
+          type="button"
+          title="מבנה ארגוני"
+          aria-label="מבנה ארגוני"
+          onClick={onOpenOrgChart}
+          style={featureBtnStyle}
+        >
+          🏢
+        </button>
+      </div>
     </div>
   );
 }
@@ -339,4 +323,32 @@ function iconBtnStyle(color: string): React.CSSProperties {
     flexShrink: 0,
     lineHeight: 1,
   };
+}
+
+const featureBtnStyle: React.CSSProperties = {
+  flexShrink: 0,
+  width: 30,
+  height: 30,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: 'rgba(255,255,255,0.05)',
+  border: '1px solid rgba(255,255,255,0.12)',
+  borderRadius: 8,
+  color: '#cbd5e1',
+  cursor: 'pointer',
+  fontFamily: 'inherit',
+  fontSize: 14,
+  lineHeight: 1,
+};
+
+function labelForScope(
+  scope: ProjectScope,
+  projects: PaperclipProject[],
+): string {
+  if (scope.kind === 'dashboard') return 'דשבורד';
+  if (scope.kind === 'general') return 'כללי';
+  return (
+    projects.find((p) => p.id === scope.projectId)?.name ?? 'פרויקט'
+  );
 }

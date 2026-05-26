@@ -203,4 +203,16 @@ export interface Character {
    * bubble layer; the two can coexist.
    */
   speechBubble: import('./engine/agentSpeech.js').SpeechBubble | null;
+
+  /**
+   * Visibility — used by the project-scope filter (Session 9.3) to
+   * hide agents not involved in the currently-selected project's
+   * issues. `targetAlpha` is the goal (1 = visible, 0 = hidden) set
+   * by the scope filter; `displayAlpha` is the smoothly-lerped current
+   * value the renderer paints. Lerp speed is tuned for a noticeable —
+   * not subtle — fade (see `feedback-ui-transitions-noticeable`).
+   * Default is 1 on both so unmodified characters render as today.
+   */
+  targetAlpha: number;
+  displayAlpha: number;
 }
